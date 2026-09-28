@@ -1,13 +1,25 @@
 const express = require("express");
+const db = require("../config/db");
+
 const router = express.Router();
 
-const pool = require("../config/db");
+const allowedSeverities = [
+    "Critical",
+    "High",
+    "Medium",
+    "Low",
+    "Info"
+];
 
+const allowedStatuses = [
+    "Open",
+    "Resolved",
+    "In Progress"
+];
 
-// GET ALL FINDINGS
 router.get("/", async (req, res) => {
     try {
-        const [rows] = await pool.query(`
+        const [rows] = await db.query(`
             SELECT
                 f.id,
                 f.assessment_id,
@@ -28,7 +40,6 @@ router.get("/", async (req, res) => {
         `);
 
         res.json(rows);
-
     } catch (error) {
         console.error("Error fetching findings:", error);
 
@@ -39,13 +50,27 @@ router.get("/", async (req, res) => {
     }
 });
 
-
-// GET ONE FINDING
 router.get("/:id", async (req, res) => {
     try {
-        const [rows] = await pool.query(
-            "SELECT * FROM findings WHERE id = ?",
-            [req.params.id]
+        const id = Number(req.params.id);
+
+        if (!Number.isInteger(id) || id < 1) {
+            return res.status(400).json({
+                error: "Invalid finding ID"
+            });
+        }
+
+        const [rows] = await db.query(
+            `
+            SELECT
+                f.*,
+                a.title AS assessment_title
+            FROM findings f
+            LEFT JOIN assessments a
+                ON f.assessment_id = a.id
+            WHERE f.id = ?
+            `,
+            [id]
         );
 
         if (rows.length === 0) {
@@ -55,7 +80,6 @@ router.get("/:id", async (req, res) => {
         }
 
         res.json(rows[0]);
-
     } catch (error) {
         console.error("Error fetching finding:", error);
 
@@ -66,8 +90,6 @@ router.get("/:id", async (req, res) => {
     }
 });
 
-
-// CREATE FINDING
 router.post("/", async (req, res) => {
     try {
         const {
@@ -82,7 +104,43 @@ router.post("/", async (req, res) => {
             status
         } = req.body;
 
-        const [result] = await pool.query(
+        if (!assessment_id || !vulnerability || !severity) {
+            return res.status(400).json({
+                error:
+                    "Assessment, vulnerability and severity are required"
+            });
+        }
+
+        if (!allowedSeverities.includes(severity)) {
+            return res.status(400).json({
+                error: "Invalid severity"
+            });
+        }
+
+        const findingStatus = status || "Open";
+
+        if (!allowedStatuses.includes(findingStatus)) {
+            return res.status(400).json({
+                error: "Invalid status"
+            });
+        }
+
+        const [assessment] = await db.query(
+            `
+            SELECT id
+            FROM assessments
+            WHERE id = ?
+            `,
+            [Number(assessment_id)]
+        );
+
+        if (assessment.length === 0) {
+            return res.status(400).json({
+                error: "Assessment does not exist"
+            });
+        }
+
+        const [result] = await db.execute(
             `
             INSERT INTO findings
             (
@@ -99,15 +157,15 @@ router.post("/", async (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             `,
             [
-                assessment_id,
-                vulnerability,
-                affected_module,
-                description,
-                observed_result,
-                impact,
+                Number(assessment_id),
+                vulnerability.trim(),
+                affected_module?.trim() || null,
+                description?.trim() || null,
+                observed_result?.trim() || null,
+                impact?.trim() || null,
                 severity,
-                mitigation,
-                status || "Open"
+                mitigation?.trim() || null,
+                findingStatus
             ]
         );
 
@@ -115,7 +173,6 @@ router.post("/", async (req, res) => {
             message: "Finding created successfully",
             id: result.insertId
         });
-
     } catch (error) {
         console.error("Error creating finding:", error);
 
@@ -126,10 +183,16 @@ router.post("/", async (req, res) => {
     }
 });
 
-
-// UPDATE FINDING
 router.put("/:id", async (req, res) => {
     try {
+        const id = Number(req.params.id);
+
+        if (!Number.isInteger(id) || id < 1) {
+            return res.status(400).json({
+                error: "Invalid finding ID"
+            });
+        }
+
         const {
             vulnerability,
             affected_module,
@@ -141,7 +204,26 @@ router.put("/:id", async (req, res) => {
             status
         } = req.body;
 
-        await pool.query(
+        if (!vulnerability || !severity) {
+            return res.status(400).json({
+                error:
+                    "Vulnerability and severity are required"
+            });
+        }
+
+        if (!allowedSeverities.includes(severity)) {
+            return res.status(400).json({
+                error: "Invalid severity"
+            });
+        }
+
+        if (!allowedStatuses.includes(status)) {
+            return res.status(400).json({
+                error: "Invalid status"
+            });
+        }
+
+        const [result] = await db.execute(
             `
             UPDATE findings
             SET
@@ -156,22 +238,27 @@ router.put("/:id", async (req, res) => {
             WHERE id = ?
             `,
             [
-                vulnerability,
-                affected_module,
-                description,
-                observed_result,
-                impact,
+                vulnerability.trim(),
+                affected_module?.trim() || null,
+                description?.trim() || null,
+                observed_result?.trim() || null,
+                impact?.trim() || null,
                 severity,
-                mitigation,
+                mitigation?.trim() || null,
                 status,
-                req.params.id
+                id
             ]
         );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                error: "Finding not found"
+            });
+        }
 
         res.json({
             message: "Finding updated successfully"
         });
-
     } catch (error) {
         console.error("Error updating finding:", error);
 
@@ -182,19 +269,33 @@ router.put("/:id", async (req, res) => {
     }
 });
 
-
-// DELETE FINDING
 router.delete("/:id", async (req, res) => {
     try {
-        await pool.query(
-            "DELETE FROM findings WHERE id = ?",
-            [req.params.id]
+        const id = Number(req.params.id);
+
+        if (!Number.isInteger(id) || id < 1) {
+            return res.status(400).json({
+                error: "Invalid finding ID"
+            });
+        }
+
+        const [result] = await db.execute(
+            `
+            DELETE FROM findings
+            WHERE id = ?
+            `,
+            [id]
         );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                error: "Finding not found"
+            });
+        }
 
         res.json({
             message: "Finding deleted successfully"
         });
-
     } catch (error) {
         console.error("Error deleting finding:", error);
 
@@ -204,6 +305,5 @@ router.delete("/:id", async (req, res) => {
         });
     }
 });
-
 
 module.exports = router;

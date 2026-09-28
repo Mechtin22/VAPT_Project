@@ -1,25 +1,12 @@
-# XAMPP / MySQL
-mysql/
-data/
-*.log
-
-# Backup files
-*_backup/
-backup/
-*.bak
-
-# Windows
-Thumbs.db
-Desktop.ini
-
-# IDE
-.vscode/
-.idea/
-
-# Environment / secrets
+node_modules/
 .env
-*.env
+.env.*
+!.env.example
 
-# Temporary files
-*.tmp
-*.temp
+backend/uploads/
+frontend/dist/
+backend/dist/
+
+*.log
+.DS_Store
+Thumbs.db

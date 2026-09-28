@@ -1,27 +1,62 @@
 import {
+    useEffect,
+    useState
+} from "react";
+
+import {
     FileText,
     Download
 } from "lucide-react";
 
-function Reports() {
+import api from "../services/api";
 
-    function downloadReport() {
+function Reports() {
+    const [assessments, setAssessments] =
+        useState([]);
+
+    const [assessmentId, setAssessmentId] =
+        useState("");
+
+    useEffect(() => {
+        api.get("/assessments")
+            .then((response) => {
+                setAssessments(
+                    response.data
+                );
+
+                if (
+                    response.data.length > 0
+                ) {
+                    setAssessmentId(
+                        String(
+                            response.data[0].id
+                        )
+                    );
+                }
+            })
+            .catch((error) =>
+                console.error(error)
+            );
+    }, []);
+
+    const downloadReport = () => {
+        if (!assessmentId) {
+            alert(
+                "Select an assessment."
+            );
+            return;
+        }
 
         window.open(
-            "http://127.0.0.1:5000/api/reports/1",
+            `http://localhost:5000/api/reports/${assessmentId}`,
             "_blank"
         );
-
-    }
+    };
 
     return (
-
         <div>
-
             <div className="page-header">
-
                 <div>
-
                     <p className="eyebrow">
                         REPORTING
                     </p>
@@ -34,32 +69,54 @@ function Reports() {
                         Generate structured
                         assessment reports.
                     </p>
-
                 </div>
-
             </div>
 
             <div className="report-card">
-
                 <div className="report-icon">
-
                     <FileText size={30} />
-
                 </div>
 
                 <div className="report-content">
-
                     <h3>
-                        DVWA Security Assessment
+                        VAPT Assessment Report
                     </h3>
 
                     <p>
-                        Generate the current
-                        assessment findings,
-                        mitigations and retest
-                        status.
+                        Generate findings,
+                        mitigations and
+                        retesting results.
                     </p>
 
+                    <select
+                        value={assessmentId}
+                        onChange={(event) =>
+                            setAssessmentId(
+                                event.target.value
+                            )
+                        }
+                    >
+                        <option value="">
+                            Select assessment
+                        </option>
+
+                        {assessments.map(
+                            (assessment) => (
+                                <option
+                                    key={
+                                        assessment.id
+                                    }
+                                    value={
+                                        assessment.id
+                                    }
+                                >
+                                    {
+                                        assessment.title
+                                    }
+                                </option>
+                            )
+                        )}
+                    </select>
                 </div>
 
                 <button
@@ -68,15 +125,10 @@ function Reports() {
                         downloadReport
                     }
                 >
-
                     <Download size={18} />
-
                     Generate PDF
-
                 </button>
-
             </div>
-
         </div>
     );
 }

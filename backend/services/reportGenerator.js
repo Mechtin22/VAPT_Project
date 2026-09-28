@@ -5,20 +5,19 @@ async function generateReport(
     assessmentId,
     res
 ) {
-
     const [assessments] =
         await db.execute(
-            `SELECT *
-             FROM assessments
-             WHERE id = ?`,
+            `
+            SELECT *
+            FROM assessments
+            WHERE id = ?
+            `,
             [assessmentId]
         );
 
     if (assessments.length === 0) {
-
         return res.status(404).json({
-            error:
-                "Assessment not found"
+            error: "Assessment not found"
         });
     }
 
@@ -27,25 +26,27 @@ async function generateReport(
 
     const [findings] =
         await db.execute(
-            `SELECT *
-             FROM findings
-             WHERE assessment_id = ?
-             ORDER BY id`,
+            `
+            SELECT *
+            FROM findings
+            WHERE assessment_id = ?
+            ORDER BY id
+            `,
             [assessmentId]
         );
 
     const [retests] =
         await db.execute(
-            `SELECT
+            `
+            SELECT
                 r.*,
                 f.vulnerability
-             FROM retests r
-             JOIN findings f
+            FROM retests r
+            JOIN findings f
                 ON r.finding_id = f.id
-             JOIN assessments a
-                ON f.assessment_id = a.id
-             WHERE a.id = ?
-             ORDER BY r.tested_at DESC`,
+            WHERE f.assessment_id = ?
+            ORDER BY r.tested_at DESC
+            `,
             [assessmentId]
         );
 
@@ -68,7 +69,7 @@ async function generateReport(
     doc.pipe(res);
 
     doc
-        .fontSize(24)
+        .fontSize(22)
         .text(
             "WEB APPLICATION SECURITY ASSESSMENT",
             {
@@ -79,7 +80,7 @@ async function generateReport(
     doc.moveDown();
 
     doc
-        .fontSize(13)
+        .fontSize(12)
         .text(
             `Assessment: ${assessment.title}`
         )
@@ -93,33 +94,48 @@ async function generateReport(
             `Status: ${assessment.status}`
         );
 
+    if (assessment.scope_description) {
+        doc
+            .moveDown()
+            .text(
+                `Scope: ${assessment.scope_description}`
+            );
+    }
+
     doc.moveDown();
 
     doc
-        .fontSize(17)
+        .fontSize(16)
         .text("Executive Summary");
 
     doc.moveDown();
 
     doc
-        .fontSize(11)
+        .fontSize(10)
         .text(
-            `The assessment identified ${findings.length} recorded security finding(s) during testing of the authorized local DVWA environment.`
+            `The assessment contains ${findings.length} recorded security finding(s).`
         );
 
     doc.moveDown();
 
     doc
-        .fontSize(17)
+        .fontSize(16)
         .text("Findings");
+
+    if (findings.length === 0) {
+        doc
+            .fontSize(10)
+            .text(
+                "No findings have been recorded."
+            );
+    }
 
     findings.forEach(
         (finding, index) => {
-
             doc.moveDown();
 
             doc
-                .fontSize(14)
+                .fontSize(13)
                 .text(
                     `${index + 1}. ${finding.vulnerability}`
                 );
@@ -134,47 +150,59 @@ async function generateReport(
                 )
                 .text(
                     `Module: ${finding.affected_module || "N/A"}`
+                )
+                .text(
+                    `Description: ${finding.description || "N/A"}`
+                )
+                .text(
+                    `Observed Result: ${finding.observed_result || "N/A"}`
+                )
+                .text(
+                    `Impact: ${finding.impact || "N/A"}`
+                )
+                .text(
+                    `Mitigation: ${finding.mitigation || "N/A"}`
                 );
-
-            doc.moveDown(0.5);
-
-            doc.text(
-                `Description: ${finding.description || "N/A"}`
-            );
-
-            doc.text(
-                `Observed Result: ${finding.observed_result || "N/A"}`
-            );
-
-            doc.text(
-                `Impact: ${finding.impact || "N/A"}`
-            );
-
-            doc.text(
-                `Mitigation: ${finding.mitigation || "N/A"}`
-            );
         }
     );
 
     doc.moveDown();
 
     doc
-        .fontSize(17)
+        .fontSize(16)
         .text("Retesting");
+
+    if (retests.length === 0) {
+        doc
+            .fontSize(10)
+            .text(
+                "No retesting records have been recorded."
+            );
+    }
 
     retests.forEach(
         (retest) => {
-
             doc.moveDown();
 
             doc
                 .fontSize(10)
                 .text(
                     `${retest.vulnerability} — ${retest.result}`
-                )
-                .text(
-                    retest.notes || ""
                 );
+
+            if (retest.tested_at) {
+                doc.text(
+                    `Tested: ${new Date(
+                        retest.tested_at
+                    ).toLocaleString()}`
+                );
+            }
+
+            if (retest.notes) {
+                doc.text(
+                    `Notes: ${retest.notes}`
+                );
+            }
         }
     );
 
@@ -183,11 +211,10 @@ async function generateReport(
     doc
         .fontSize(9)
         .text(
-            "This report documents testing performed only against the authorized local assessment environment."
+            "This report documents testing performed against the authorized local assessment environment."
         );
 
     doc.end();
 }
 
-module.exports =
-    generateReport;
+module.exports = generateReport;

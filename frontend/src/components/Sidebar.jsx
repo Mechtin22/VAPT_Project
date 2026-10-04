@@ -2,6 +2,7 @@ import {
     LayoutDashboard,
     ClipboardList,
     Bug,
+    FileCode2,
     Image,
     RefreshCw,
     FileText,
@@ -11,6 +12,7 @@ import {
 import { NavLink } from "react-router-dom";
 
 function Sidebar() {
+
     const menuItems = [
         {
             name: "Dashboard",
@@ -26,6 +28,11 @@ function Sidebar() {
             name: "Findings",
             path: "/findings",
             icon: Bug
+        },
+        {
+            name: "HTTP Requests",
+            path: "/http-requests",
+            icon: FileCode2
         },
         {
             name: "Evidence",
@@ -47,8 +54,10 @@ function Sidebar() {
     return (
         <aside className="sidebar">
 
-            <div className="sidebar-logo">
-                <div className="logo-icon">
+            {/* BRAND */}
+            <div className="brand">
+
+                <div className="brand-icon">
                     <Shield size={24} />
                 </div>
 
@@ -56,13 +65,18 @@ function Sidebar() {
                     <h2>VAPT</h2>
                     <span>Security Center</span>
                 </div>
+
             </div>
 
-            <nav className="sidebar-nav">
+            {/* NAVIGATION */}
+            <span className="menu-label">
+                MAIN MENU
+            </span>
 
-                <p className="nav-title">MAIN MENU</p>
+            <nav>
 
                 {menuItems.map((item) => {
+
                     const Icon = item.icon;
 
                     return (
@@ -70,26 +84,36 @@ function Sidebar() {
                             key={item.path}
                             to={item.path}
                             className={({ isActive }) =>
-                                `nav-item ${isActive ? "active" : ""}`
+                                isActive ? "nav-link active" : "nav-link"
                             }
                         >
-                            <Icon size={20} />
-                            <span>{item.name}</span>
+                            <Icon size={18} />
+
+                            <span>
+                                {item.name}
+                            </span>
                         </NavLink>
                     );
+
                 })}
 
             </nav>
 
+            {/* FOOTER */}
             <div className="sidebar-footer">
-                <div className="security-status">
-                    <span className="status-dot"></span>
 
-                    <div>
-                        <strong>Lab Environment</strong>
-                        <small>Localhost Protected</small>
-                    </div>
+                <span className="status-dot"></span>
+
+                <div>
+                    <strong>
+                        Lab Environment
+                    </strong>
+
+                    <small>
+                        Localhost Protected
+                    </small>
                 </div>
+
             </div>
 
         </aside>

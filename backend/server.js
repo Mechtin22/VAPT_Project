@@ -2,19 +2,29 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
+
 require("dotenv").config();
 
 const assessmentRoutes = require("./routes/assessments");
 const findingRoutes = require("./routes/findings");
-const retestRoutes = require("./routes/retests");
 const evidenceRoutes = require("./routes/evidence");
+const retestRoutes = require("./routes/retests");
 const reportRoutes = require("./routes/reports");
+const httpRequestRoutes = require("./routes/httpRequests");
 
 const app = express();
 
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT || 5000);
 
-const uploadsDirectory = path.join(__dirname, "uploads");
+
+// =========================================================
+// UPLOAD DIRECTORY
+// =========================================================
+
+const uploadsDirectory = path.join(
+    __dirname,
+    "uploads"
+);
 
 if (!fs.existsSync(uploadsDirectory)) {
     fs.mkdirSync(uploadsDirectory, {
@@ -22,25 +32,87 @@ if (!fs.existsSync(uploadsDirectory)) {
     });
 }
 
+
+// =========================================================
+// CORS
+// =========================================================
+
+const allowedOrigins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+];
+
 app.use(
     cors({
-        origin: "http://localhost:5173"
+        origin: (origin, callback) => {
+
+            // Allow requests such as Postman/curl
+            // where Origin may not exist.
+            if (!origin) {
+                return callback(null, true);
+            }
+
+            if (allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+
+            return callback(
+                new Error("CORS origin not allowed")
+            );
+        }
     })
 );
 
-app.use(express.json());
+
+// =========================================================
+// BODY PARSING
+// =========================================================
+
+app.use(
+    express.json({
+        limit: "2mb"
+    })
+);
+
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "2mb"
+    })
+);
+
+
+// =========================================================
+// STATIC UPLOADS
+// =========================================================
 
 app.use(
     "/uploads",
     express.static(uploadsDirectory)
 );
 
-app.get("/api/health", (req, res) => {
-    res.json({
-        status: "OK",
-        message: "VAPT Dashboard API running"
-    });
-});
+
+// =========================================================
+// HEALTH CHECK
+// =========================================================
+
+app.get(
+    "/api/health",
+    (req, res) => {
+
+        res.json({
+            status: "OK",
+            message: "VAPT Dashboard API running",
+            timestamp: new Date().toISOString()
+        });
+
+    }
+);
+
+
+// =========================================================
+// API ROUTES
+// =========================================================
 
 app.use(
     "/api/assessments",
@@ -53,13 +125,13 @@ app.use(
 );
 
 app.use(
-    "/api/retests",
-    retestRoutes
+    "/api/evidence",
+    evidenceRoutes
 );
 
 app.use(
-    "/api/evidence",
-    evidenceRoutes
+    "/api/retests",
+    retestRoutes
 );
 
 app.use(
@@ -67,25 +139,65 @@ app.use(
     reportRoutes
 );
 
-app.use((err, req, res, next) => {
-    console.error(err);
+app.use(
+    "/api/requests",
+    httpRequestRoutes
+);
 
-    if (res.headersSent) {
-        return next(err);
+
+// =========================================================
+// 404 HANDLER
+// =========================================================
+
+app.use(
+    (req, res) => {
+
+        res.status(404).json({
+            error: "API endpoint not found",
+            path: req.originalUrl
+        });
+
     }
+);
 
-    res.status(500).json({
-        error: "Internal server error",
-        message: err.message
-    });
-});
+
+// =========================================================
+// GLOBAL ERROR HANDLER
+// =========================================================
+
+app.use(
+    (err, req, res, next) => {
+
+        console.error(
+            "Server error:",
+            err
+        );
+
+        if (res.headersSent) {
+            return next(err);
+        }
+
+        res.status(500).json({
+            error: "Internal server error",
+            message: err.message
+        });
+
+    }
+);
+
+
+// =========================================================
+// START SERVER
+// =========================================================
 
 app.listen(
     PORT,
     "127.0.0.1",
     () => {
+
         console.log(
             `VAPT Backend running at http://localhost:${PORT}`
         );
+
     }
 );

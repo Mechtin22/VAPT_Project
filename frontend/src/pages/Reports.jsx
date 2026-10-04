@@ -10,53 +10,95 @@ import {
 
 import api from "../services/api";
 
+
 function Reports() {
+
     const [assessments, setAssessments] =
         useState([]);
 
     const [assessmentId, setAssessmentId] =
         useState("");
 
-    useEffect(() => {
-        api.get("/assessments")
-            .then((response) => {
-                setAssessments(
-                    response.data
-                );
 
-                if (
-                    response.data.length > 0
-                ) {
-                    setAssessmentId(
-                        String(
-                            response.data[0].id
-                        )
+    useEffect(() => {
+
+        const loadAssessments =
+            async () => {
+
+                try {
+
+                    const response =
+                        await api.get(
+                            "/assessments"
+                        );
+
+                    setAssessments(
+                        response.data
                     );
+
+                    if (
+                        response.data.length > 0
+                    ) {
+
+                        setAssessmentId(
+                            String(
+                                response.data[0].id
+                            )
+                        );
+
+                    }
+
+                } catch (error) {
+
+                    console.error(
+                        "Failed to load assessments:",
+                        error
+                    );
+
                 }
-            })
-            .catch((error) =>
-                console.error(error)
-            );
+
+            };
+
+
+        loadAssessments();
+
     }, []);
 
+
     const downloadReport = () => {
+
         if (!assessmentId) {
+
             alert(
                 "Select an assessment."
             );
+
             return;
+
         }
 
+
+        const reportUrl =
+            `${api.defaults.baseURL}/reports/${assessmentId}`;
+
+
         window.open(
-            `http://localhost:5000/api/reports/${assessmentId}`,
-            "_blank"
+            reportUrl,
+            "_blank",
+            "noopener,noreferrer"
         );
+
     };
 
+
     return (
+
         <div>
+
             <div className="page-header">
+
                 <div>
+
                     <p className="eyebrow">
                         REPORTING
                     </p>
@@ -69,15 +111,25 @@ function Reports() {
                         Generate structured
                         assessment reports.
                     </p>
+
                 </div>
+
             </div>
 
+
             <div className="report-card">
+
                 <div className="report-icon">
-                    <FileText size={30} />
+
+                    <FileText
+                        size={30}
+                    />
+
                 </div>
 
+
                 <div className="report-content">
+
                     <h3>
                         VAPT Assessment Report
                     </h3>
@@ -88,20 +140,27 @@ function Reports() {
                         retesting results.
                     </p>
 
+
                     <select
-                        value={assessmentId}
-                        onChange={(event) =>
-                            setAssessmentId(
-                                event.target.value
-                            )
+                        value={
+                            assessmentId
+                        }
+                        onChange={
+                            (event) =>
+                                setAssessmentId(
+                                    event.target.value
+                                )
                         }
                     >
+
                         <option value="">
                             Select assessment
                         </option>
 
+
                         {assessments.map(
                             (assessment) => (
+
                                 <option
                                     key={
                                         assessment.id
@@ -114,23 +173,39 @@ function Reports() {
                                         assessment.title
                                     }
                                 </option>
+
                             )
                         )}
+
                     </select>
+
                 </div>
+
 
                 <button
                     className="primary-btn"
                     onClick={
                         downloadReport
                     }
+                    disabled={
+                        !assessmentId
+                    }
                 >
-                    <Download size={18} />
+
+                    <Download
+                        size={18}
+                    />
+
                     Generate PDF
+
                 </button>
+
             </div>
+
         </div>
+
     );
 }
+
 
 export default Reports;

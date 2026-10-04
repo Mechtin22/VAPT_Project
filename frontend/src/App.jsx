@@ -4,35 +4,21 @@ import {
     Route
 } from "react-router-dom";
 
-import Dashboard
-    from "./pages/Dashboard";
+import Dashboard from "./pages/Dashboard";
+import Assessments from "./pages/Assessments";
+import Findings from "./pages/Findings";
+import Evidence from "./pages/Evidence";
+import Retesting from "./pages/Retesting";
+import Reports from "./pages/Reports";
+import HttpRequests from "./httpRequests";
 
-import Assessments
-    from "./pages/Assessments";
-
-import Findings
-    from "./pages/Findings";
-
-import Evidence
-    from "./pages/Evidence";
-
-import Retesting
-    from "./pages/Retesting";
-
-import Reports
-    from "./pages/Reports";
-
-import Sidebar
-    from "./components/Sidebar";
-
-import Navbar
-    from "./components/Navbar";
-
-import "./index.css";
+import Sidebar from "./components/Sidebar";
+import Navbar from "./components/Navbar";
 
 function App() {
 
     return (
+
         <BrowserRouter>
 
             <div className="app">
@@ -69,6 +55,13 @@ function App() {
                             />
 
                             <Route
+                                path="/http-requests"
+                                element={
+                                    <HttpRequests />
+                                }
+                            />
+
+                            <Route
                                 path="/evidence"
                                 element={
                                     <Evidence />
@@ -98,7 +91,9 @@ function App() {
             </div>
 
         </BrowserRouter>
+
     );
 }
+
 
 export default App;

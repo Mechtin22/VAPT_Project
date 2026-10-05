@@ -11,6 +11,7 @@ const evidenceRoutes = require("./routes/evidence");
 const retestRoutes = require("./routes/retests");
 const reportRoutes = require("./routes/reports");
 const httpRequestRoutes = require("./routes/httpRequests");
+const scanRoutes = require("./routes/scans");
 
 const app = express();
 
@@ -144,6 +145,10 @@ app.use(
     httpRequestRoutes
 );
 
+app.use(
+    "/api/scans",
+    scanRoutes
+);
 
 // =========================================================
 // 404 HANDLER

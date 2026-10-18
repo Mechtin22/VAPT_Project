@@ -1,18 +1,87 @@
 const { URL } = require("url");
 
-const MAX_PAGES = 40;
+// =========================================================
+// DVWA SCANNER CONFIGURATION
+// =========================================================
+
+const MAX_RESOURCES = 100;
 const MAX_FORMS = 60;
 const REQUEST_TIMEOUT = 8000;
 const MAX_BODY = 800000;
 
+const BLOCKED_PATHS = [
+    "/logout",
+    "/setup.php",
+    "/phpinfo.php",
+    "/view_source",
+    "/security.php",
+    "/csrf/",
+    "/upload/",
+    "/delete",
+    "/remove"
+];
+
+const STATIC_EXTENSIONS =
+    /\.(?:css|js|mjs|map|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|pdf|zip|gz)$/i;
+
+
+// =========================================================
+// DVWA TARGET VALIDATION
+// =========================================================
+
+function assertDvwaRoot(value) {
+    let target;
+
+    try {
+        target = new URL(value);
+    } catch {
+        throw new Error("Invalid target URL.");
+    }
+
+    if (!["http:", "https:"].includes(target.protocol)) {
+        throw new Error(
+            "The DVWA target must use HTTP or HTTPS."
+        );
+    }
+
+    if (
+        !["localhost", "127.0.0.1"].includes(
+            target.hostname.toLowerCase()
+        )
+    ) {
+        throw new Error(
+            "DVWA-only scanner: targets must be localhost or 127.0.0.1."
+        );
+    }
+
+    if (
+        target.username ||
+        target.password ||
+        !/^\/dvwa\/?$/i.test(target.pathname) ||
+        target.search ||
+        target.hash
+    ) {
+        throw new Error(
+            "DVWA-only scanner: use the local DVWA root URL, for example http://localhost/DVWA/ ."
+        );
+    }
+
+    target.pathname =
+        `${target.pathname.replace(/\/$/, "")}/`;
+
+    return target;
+}
+
+
 // =========================================================
 // SESSION CLIENT
-// Keeps cookies between requests.
-// This is required for authenticated DVWA scanning.
+// Maintains cookies and restricts requests to DVWA.
 // =========================================================
 
 class SessionClient {
-    constructor() {
+    constructor(origin, rootPath) {
+        this.origin = origin;
+        this.rootPath = rootPath.toLowerCase();
         this.cookies = new Map();
     }
 
@@ -21,90 +90,86 @@ class SessionClient {
     }
 
     updateCookies(response) {
-        let setCookies = [];
+        let cookieHeaders = [];
 
         if (
-            response.headers &&
-            typeof response.headers.getSetCookie === "function"
+            typeof response.headers.getSetCookie ===
+            "function"
         ) {
-            setCookies =
+            cookieHeaders =
                 response.headers.getSetCookie();
         } else {
-            const single =
+            const cookie =
                 response.headers.get("set-cookie");
 
-            if (single) {
-                setCookies = [single];
+            if (cookie) {
+                cookieHeaders = [cookie];
             }
         }
 
-        for (const cookie of setCookies) {
-            const firstPart =
-                cookie.split(";")[0];
+        for (const cookie of cookieHeaders) {
+            const firstPart = cookie.split(";")[0];
+            const splitAt = firstPart.indexOf("=");
 
-            const separator =
-                firstPart.indexOf("=");
-
-            if (separator === -1) {
+            if (splitAt < 1) {
                 continue;
             }
 
-            const name =
-                firstPart
-                    .slice(0, separator)
-                    .trim();
-
-            const value =
-                firstPart
-                    .slice(separator + 1)
-                    .trim();
-
-            if (name) {
-                this.cookies.set(
-                    name,
-                    value
-                );
-            }
+            this.cookies.set(
+                firstPart.slice(0, splitAt).trim(),
+                firstPart.slice(splitAt + 1).trim()
+            );
         }
     }
 
-    getCookieHeader() {
-        return Array.from(
-            this.cookies.entries()
-        )
-            .map(
-                ([name, value]) =>
-                    `${name}=${value}`
-            )
-            .join("; ");
+    inScope(value) {
+        try {
+            const parsed = new URL(value, this.origin);
+            const path = parsed.pathname.toLowerCase();
+
+            return (
+                parsed.origin === this.origin &&
+                (
+                    path === this.rootPath.slice(0, -1) ||
+                    path.startsWith(this.rootPath)
+                )
+            );
+        } catch {
+            return false;
+        }
     }
 
     async request(
-        url,
+        value,
         options = {},
         redirectCount = 0
     ) {
-        if (redirectCount > 5) {
+        const url =
+            new URL(value, this.origin).toString();
+
+        if (!this.inScope(url)) {
             throw new Error(
-                "Too many redirects."
+                "Blocked request outside the local DVWA application scope."
             );
         }
 
-        const controller =
-            new AbortController();
-
-        const timer =
-            setTimeout(
-                () => {
-                    controller.abort();
-                },
-                REQUEST_TIMEOUT
+        if (redirectCount > 5) {
+            throw new Error(
+                "Too many redirects while scanning DVWA."
             );
+        }
+
+        const controller = new AbortController();
+
+        const timer = setTimeout(
+            () => controller.abort(),
+            REQUEST_TIMEOUT
+        );
 
         try {
             const headers = {
                 "User-Agent":
-                    "VAPT-Scanner/1.0 (authorized-lab)",
+                    "VAPT-DVWA-Scanner/1.0 (authorized-local-lab)",
 
                 "Accept":
                     "text/html,application/xhtml+xml,*/*",
@@ -112,69 +177,54 @@ class SessionClient {
                 ...(options.headers || {})
             };
 
-            const cookieHeader =
-                this.getCookieHeader();
-
-            if (cookieHeader) {
-                headers.Cookie =
-                    cookieHeader;
+            if (this.cookies.size) {
+                headers.Cookie = Array.from(
+                    this.cookies.entries()
+                )
+                    .map(([key, value]) => `${key}=${value}`)
+                    .join("; ");
             }
 
-            const response =
-                await fetch(
-                    url,
-                    {
-                        ...options,
-
-                        headers,
-
-                        redirect:
-                            "manual",
-
-                        signal:
-                            controller.signal
-                    }
-                );
-
-            this.updateCookies(
-                response
+            const response = await fetch(
+                url,
+                {
+                    ...options,
+                    headers,
+                    redirect: "manual",
+                    signal: controller.signal
+                }
             );
 
-            // -------------------------------------------------
-            // HANDLE REDIRECTS
-            // -------------------------------------------------
+            this.updateCookies(response);
 
+            // Follow redirects only within this DVWA installation.
             if (
                 response.status >= 300 &&
                 response.status < 400
             ) {
                 const location =
-                    response.headers.get(
-                        "location"
-                    );
+                    response.headers.get("location");
 
                 if (location) {
                     const nextUrl =
-                        new URL(
-                            location,
-                            url
-                        ).toString();
+                        new URL(location, url).toString();
+
+                    if (!this.inScope(nextUrl)) {
+                        throw new Error(
+                            "Blocked redirect outside the configured DVWA application."
+                        );
+                    }
 
                     const nextOptions = {
                         ...options
                     };
 
-                    // Browser-like behavior:
-                    // after a 301/302/303 redirect,
-                    // turn POST into GET.
                     if (
-                        response.status === 301 ||
-                        response.status === 302 ||
-                        response.status === 303
+                        [301, 302, 303].includes(
+                            response.status
+                        )
                     ) {
-                        nextOptions.method =
-                            "GET";
-
+                        nextOptions.method = "GET";
                         delete nextOptions.body;
                     }
 
@@ -186,28 +236,18 @@ class SessionClient {
                 }
             }
 
-            const body =
-                await response.text();
+            const body = await response.text();
 
             return {
-                url:
-                    response.url || url,
+                url: response.url || url,
+                status: response.status,
 
-                status:
-                    response.status,
+                headers: Object.fromEntries(
+                    response.headers.entries()
+                ),
 
-                headers:
-                    Object.fromEntries(
-                        response.headers.entries()
-                    ),
-
-                body:
-                    body.slice(
-                        0,
-                        MAX_BODY
-                    )
+                body: body.slice(0, MAX_BODY)
             };
-
         } finally {
             clearTimeout(timer);
         }
@@ -219,77 +259,104 @@ class SessionClient {
 // HTTP HELPERS
 // =========================================================
 
-async function fetchPage(
-    client,
-    url
-) {
+async function fetchPage(client, url) {
     return client.request(
         url,
-        {
-            method:
-                "GET"
-        }
+        { method: "GET" }
     );
 }
 
+async function postForm(client, url, data) {
+    const body = new URLSearchParams();
 
-async function postForm(
-    client,
-    url,
-    data
-) {
-    const body =
-        new URLSearchParams();
-
-    for (
-        const [key, value]
-        of Object.entries(data)
-    ) {
+    for (const [key, value] of Object.entries(data)) {
         body.append(
             key,
-            value == null
-                ? ""
-                : String(value)
+            value == null ? "" : String(value)
         );
     }
 
     return client.request(
         url,
         {
-            method:
-                "POST",
+            method: "POST",
 
             headers: {
                 "Content-Type":
                     "application/x-www-form-urlencoded"
             },
 
-            body:
-                body.toString()
+            body: body.toString()
         }
     );
 }
 
 
 // =========================================================
-// URL NORMALIZATION
+// URL SCOPE AND NORMALIZATION
 // =========================================================
 
-function normalizeUrl(
-    value,
-    base
-) {
+function inDvwaPath(value, rootUrl) {
     try {
-        const url =
-            new URL(
-                value,
-                base
-            );
+        const parsed = new URL(value, rootUrl);
+        const root = new URL(rootUrl);
 
-        url.hash = "";
+        return (
+            parsed.origin === root.origin &&
+            (
+                parsed.pathname.toLowerCase() ===
+                    root.pathname.slice(0, -1).toLowerCase() ||
+                parsed.pathname.toLowerCase().startsWith(
+                    root.pathname.toLowerCase()
+                )
+            )
+        );
+    } catch {
+        return false;
+    }
+}
 
-        return url.toString();
+function normalizeUrl(value, baseUrl, rootUrl) {
+    if (!value) {
+        return null;
+    }
 
+    const trimmed = String(value).trim();
+
+    if (
+        !trimmed ||
+        /^(?:#|javascript:|mailto:|tel:|data:)/i.test(
+            trimmed
+        )
+    ) {
+        return null;
+    }
+
+    try {
+        const parsed = new URL(trimmed, baseUrl);
+
+        parsed.hash = "";
+
+        if (
+            !inDvwaPath(parsed.toString(), rootUrl)
+        ) {
+            return null;
+        }
+
+        if (STATIC_EXTENSIONS.test(parsed.pathname)) {
+            return null;
+        }
+
+        if (
+            BLOCKED_PATHS.some(
+                (part) =>
+                    parsed.pathname.toLowerCase().includes(part)
+            )
+        ) {
+            return null;
+        }
+
+        return parsed.toString();
     } catch {
         return null;
     }
@@ -297,167 +364,68 @@ function normalizeUrl(
 
 
 // =========================================================
-// SAME HOST CHECK
+// HTML ATTRIBUTE PARSING
 // =========================================================
 
-function sameHost(
-    first,
-    second
-) {
-    try {
-        return (
-            new URL(first).host ===
-            new URL(second).host
-        );
+function getAttributes(text) {
+    const attrs = {};
 
-    } catch {
-        return false;
+    const regex =
+        /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+
+    let match;
+
+    while (
+        (match = regex.exec(text || "")) !== null
+    ) {
+        const key = match[1].toLowerCase();
+
+        attrs[key] =
+            match[2] ??
+            match[3] ??
+            match[4] ??
+            "";
     }
+
+    return attrs;
 }
 
 
 // =========================================================
-// DISCOVER LINKS
+// DISCOVER DVWA LINKS
 // =========================================================
 
-function discoverLinks(
-    html,
-    baseUrl
-) {
-    const links =
-        new Set();
-
-    const regex =
-        /(?:href|action)\s*=\s*["']([^"'#]+)["']/gi;
+function discoverLinks(html, baseUrl, rootUrl) {
+    const links = new Set();
+    const regex = /<a\b([^>]*)>/gi;
 
     let match;
 
     while (
         (match = regex.exec(html)) !== null
     ) {
-        const url =
-            normalizeUrl(
-                match[1],
-                baseUrl
-            );
+        const attrs = getAttributes(match[1]);
 
-        if (
-            url &&
-            sameHost(
-                url,
-                baseUrl
-            )
-        ) {
-            links.add(url);
+        const link = normalizeUrl(
+            attrs.href,
+            baseUrl,
+            rootUrl
+        );
+
+        if (link) {
+            links.add(link);
         }
     }
 
-    return Array.from(
-        links
-    );
+    return Array.from(links);
 }
 
 
 // =========================================================
-// SHOULD CRAWL URL?
-// Avoid destructive/admin actions.
+// DISCOVER FORMS AND INPUT PARAMETERS
 // =========================================================
 
-function shouldCrawl(
-    url
-) {
-    try {
-        const pathname =
-            new URL(url)
-                .pathname
-                .toLowerCase();
-
-        const blocked = [
-            "/logout.php",
-            "/setup.php",
-            "/phpinfo.php",
-            "/view_source.php",
-            "/view_source_all.php"
-        ];
-
-        return !blocked.some(
-            (item) =>
-                pathname.includes(item)
-        );
-
-    } catch {
-        return false;
-    }
-}
-
-
-// =========================================================
-// SHOULD TEST FORM?
-// Avoid forms that change state or perform
-// destructive operations.
-// =========================================================
-
-function shouldTestForm(
-    action
-) {
-    try {
-        const pathname =
-            new URL(action)
-                .pathname
-                .toLowerCase();
-
-        const blocked = [
-            "/logout.php",
-            "/setup.php",
-            "/security.php",
-            "/csrf/",
-            "/upload/"
-        ];
-
-        return !blocked.some(
-            (item) =>
-                pathname.includes(item)
-        );
-
-    } catch {
-        return false;
-    }
-}
-
-
-// =========================================================
-// GET ATTRIBUTE
-// =========================================================
-
-function getAttribute(
-    attributes,
-    name
-) {
-    const regex =
-        new RegExp(
-            `${name}\\s*=\\s*["']([^"']*)["']`,
-            "i"
-        );
-
-    const match =
-        attributes.match(
-            regex
-        );
-
-    return match
-        ? match[1]
-        : "";
-}
-
-
-// =========================================================
-// DISCOVER FORMS
-// =========================================================
-
-function discoverForms(
-    html,
-    baseUrl
-) {
+function discoverForms(html, baseUrl, rootUrl) {
     const forms = [];
 
     const formRegex =
@@ -466,236 +434,113 @@ function discoverForms(
     let match;
 
     while (
-        (match = formRegex.exec(html)) !== null
+        (match = formRegex.exec(html)) !== null &&
+        forms.length < MAX_FORMS
     ) {
-        const attributes =
-            match[1] || "";
+        const formAttrs = getAttributes(match[1]);
 
-        const formBody =
-            match[2] || "";
-
-        const actionValue =
-            getAttribute(
-                attributes,
-                "action"
-            );
-
-        const methodValue =
-            getAttribute(
-                attributes,
-                "method"
-            );
-
-        const action =
-            normalizeUrl(
-                actionValue || baseUrl,
-                baseUrl
-            );
+        const action = normalizeUrl(
+            formAttrs.action || baseUrl,
+            baseUrl,
+            rootUrl
+        );
 
         if (!action) {
             continue;
         }
 
-        if (
-            !sameHost(
-                action,
-                baseUrl
-            )
-        ) {
-            continue;
-        }
-
-        if (
-            !shouldTestForm(
-                action
-            )
-        ) {
-            continue;
-        }
-
+        const body = match[2] || "";
         const inputs = [];
 
-        // -------------------------------------------------
-        // INPUT ELEMENTS
-        // -------------------------------------------------
-
-        const inputRegex =
-            /<input\b([^>]*)>/gi;
-
+        // INPUT elements
+        const inputRegex = /<input\b([^>]*)>/gi;
         let inputMatch;
 
         while (
-            (inputMatch =
-                inputRegex.exec(
-                    formBody
-                )) !== null
+            (inputMatch = inputRegex.exec(body)) !== null
         ) {
-            const inputAttributes =
-                inputMatch[1] || "";
+            const attrs = getAttributes(inputMatch[1]);
 
-            const name =
-                getAttribute(
-                    inputAttributes,
-                    "name"
-                );
-
-            if (!name) {
+            if (!attrs.name) {
                 continue;
             }
 
-            const type =
-                (
-                    getAttribute(
-                        inputAttributes,
-                        "type"
-                    ) || "text"
-                ).toLowerCase();
-
-            const value =
-                getAttribute(
-                    inputAttributes,
-                    "value"
-                );
-
             inputs.push({
-                name,
-                type,
-                value
+                name: attrs.name,
+                type: (attrs.type || "text").toLowerCase(),
+                value: attrs.value || ""
             });
         }
 
-
-        // -------------------------------------------------
-        // TEXTAREA ELEMENTS
-        // -------------------------------------------------
-
+        // TEXTAREA elements
         const textareaRegex =
             /<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/gi;
 
-        let textareaMatch;
+        let areaMatch;
 
         while (
-            (textareaMatch =
-                textareaRegex.exec(
-                    formBody
-                )) !== null
+            (areaMatch = textareaRegex.exec(body)) !== null
         ) {
-            const attributesText =
-                textareaMatch[1] || "";
+            const attrs = getAttributes(areaMatch[1]);
 
-            const name =
-                getAttribute(
-                    attributesText,
-                    "name"
-                );
-
-            if (!name) {
-                continue;
+            if (attrs.name) {
+                inputs.push({
+                    name: attrs.name,
+                    type: "textarea",
+                    value: areaMatch[2].trim()
+                });
             }
-
-            const value =
-                textareaMatch[2] || "";
-
-            inputs.push({
-                name,
-                type:
-                    "textarea",
-                value:
-                    value.trim()
-            });
         }
 
-
-        // -------------------------------------------------
-        // SELECT ELEMENTS
-        // -------------------------------------------------
-
+        // SELECT elements
         const selectRegex =
             /<select\b([^>]*)>([\s\S]*?)<\/select>/gi;
 
         let selectMatch;
 
         while (
-            (selectMatch =
-                selectRegex.exec(
-                    formBody
-                )) !== null
+            (selectMatch = selectRegex.exec(body)) !== null
         ) {
-            const attributesText =
-                selectMatch[1] || "";
+            const attrs = getAttributes(selectMatch[1]);
 
-            const selectBody =
-                selectMatch[2] || "";
-
-            const name =
-                getAttribute(
-                    attributesText,
-                    "name"
-                );
-
-            if (!name) {
+            if (!attrs.name) {
                 continue;
             }
 
-            const optionMatch =
-                selectBody.match(
-                    /<option\b([^>]*)>([\s\S]*?)<\/option>/i
+            const option =
+                /<option\b([^>]*)>([\s\S]*?)<\/option>/i.exec(
+                    selectMatch[2]
                 );
 
-            let value = "1";
-
-            if (optionMatch) {
-                value =
-                    getAttribute(
-                        optionMatch[1] || "",
-                        "value"
-                    );
-
-                if (!value) {
-                    value =
-                        (
-                            optionMatch[2] || ""
-                        ).trim();
-                }
-            }
+            const optionAttrs = option
+                ? getAttributes(option[1])
+                : {};
 
             inputs.push({
-                name,
-                type:
-                    "select",
-                value
+                name: attrs.name,
+                type: "select",
+
+                value:
+                    optionAttrs.value ||
+                    (option ? option[2].trim() : "1")
             });
         }
 
-
-        if (
-            inputs.length === 0
-        ) {
+        if (!inputs.length) {
             continue;
         }
-
 
         forms.push({
             action,
 
             method:
-                (
-                    methodValue || "GET"
-                ).toUpperCase(),
+                (formAttrs.method || "GET").toUpperCase() === "POST"
+                    ? "POST"
+                    : "GET",
 
-            source:
-                baseUrl,
-
+            source: baseUrl,
             inputs
         });
-
-
-        if (
-            forms.length >=
-            MAX_FORMS
-        ) {
-            break;
-        }
     }
 
     return forms;
@@ -703,12 +548,10 @@ function discoverForms(
 
 
 // =========================================================
-// SQL ERROR DETECTION
+// SQL ERROR SIGNATURES
 // =========================================================
 
-function looksLikeSqlError(
-    body
-) {
+function looksLikeSqlError(body) {
     const signatures = [
         /sql syntax/i,
         /mysql_fetch/i,
@@ -724,110 +567,77 @@ function looksLikeSqlError(
     ];
 
     return signatures.some(
-        (pattern) =>
-            pattern.test(body)
+        (pattern) => pattern.test(body || "")
     );
 }
 
 
 // =========================================================
-// NORMALIZE RESPONSE
-// Used to compare responses while ignoring
-// the random scanner marker.
+// FINDING DEDUPLICATION
 // =========================================================
 
-function normalizeBody(
-    body
-) {
-    return body
-        .replace(
-            /\s+/g,
-            " "
-        )
-        .trim();
+function addFinding(findings, seen, finding) {
+    const key =
+        `${finding.vulnerability}|${finding.affected_module}`;
+
+    if (seen.has(key)) {
+        return;
+    }
+
+    seen.add(key);
+    findings.push(finding);
 }
 
 
 // =========================================================
-// BUILD QUERY
+// BUILD QUERY PARAMETERS
 // =========================================================
 
-function buildQuery(
-    url,
-    parameter,
-    value
-) {
-    const target =
-        new URL(url);
+function buildQuery(url, parameter, value) {
+    const parsed = new URL(url);
 
-    target.searchParams.set(
+    parsed.searchParams.set(
         parameter,
         value
     );
 
-    return target.toString();
+    return parsed.toString();
 }
 
 
 // =========================================================
 // BUILD FORM DATA
+// Preserves hidden tokens and submit controls, but does
+// not actively test passwords, files, checkboxes or radios.
 // =========================================================
 
-function buildFormData(
-    form,
-    testedParameter,
-    testedValue
-) {
+function buildFormData(form, testedParameter, testedValue) {
     const data = {};
 
-    for (
-        const input
-        of form.inputs
-    ) {
-        const type =
-            input.type.toLowerCase();
+    for (const input of form.inputs) {
+        const type = input.type.toLowerCase();
 
-        // Do not submit file/password controls.
         if (
             [
                 "file",
                 "password",
                 "button",
-                "reset"
+                "reset",
+                "checkbox",
+                "radio"
             ].includes(type)
         ) {
             continue;
         }
 
-        if (
-            type === "submit"
-        ) {
-            if (input.name) {
-                data[input.name] =
-                    input.value ||
-                    "Submit";
-            }
-
-            continue;
-        }
-
-        if (
-            type === "checkbox" ||
-            type === "radio"
-        ) {
-            continue;
-        }
-
-        if (
-            input.name ===
-            testedParameter
-        ) {
+        if (type === "submit") {
             data[input.name] =
-                testedValue;
+                input.value || "Submit";
         } else {
             data[input.name] =
-                input.value ||
-                "1";
+                input.name === testedParameter
+                    ? testedValue
+                    : (input.value || "1");
         }
     }
 
@@ -836,268 +646,172 @@ function buildFormData(
 
 
 // =========================================================
-// ADD FINDING
+// SEND A TEST REQUEST
 // =========================================================
 
-function addFinding(
-    findings,
-    seen,
-    finding
+async function issueTestRequest(
+    client,
+    requestInfo,
+    parameter,
+    value
 ) {
-    const key =
-        [
-            finding.vulnerability,
-            finding.affected_module
-        ].join("|");
+    if (requestInfo.form) {
+        const data = buildFormData(
+            requestInfo.form,
+            parameter,
+            value
+        );
 
-    if (
-        seen.has(key)
-    ) {
-        return;
+        if (requestInfo.method === "POST") {
+            return postForm(
+                client,
+                requestInfo.url,
+                data
+            );
+        }
+
+        const url = new URL(requestInfo.url);
+
+        for (const [key, fieldValue] of Object.entries(data)) {
+            url.searchParams.set(
+                key,
+                String(fieldValue)
+            );
+        }
+
+        return fetchPage(
+            client,
+            url.toString()
+        );
     }
 
-    seen.add(key);
-
-    findings.push(
-        finding
+    return fetchPage(
+        client,
+        buildQuery(
+            requestInfo.url,
+            parameter,
+            value
+        )
     );
 }
 
 
 // =========================================================
-// TEST XSS
+// REFLECTED XSS TEST
+// This checks marker reflection; manually validate the
+// HTML context before treating it as confirmed executable XSS.
 // =========================================================
 
 async function testXss(
     client,
     requestInfo,
     parameter,
-    baselineBody,
     findings,
     seen
 ) {
     const marker =
-        "VAPT_REFLECT_" +
-        Math.random()
-            .toString(36)
-            .slice(2, 10);
+        `VAPT_REFLECT_${Math.random().toString(36).slice(2, 10)}`;
 
-    const payload =
-        "\"><vapt-" +
-        marker +
-        ">";
-
+    const payload = `"><vapt-${marker}>`;
 
     try {
-        let response;
+        const response = await issueTestRequest(
+            client,
+            requestInfo,
+            parameter,
+            payload
+        );
 
-        if (
-            requestInfo.method ===
-            "GET"
-        ) {
-            response =
-                await fetchPage(
-                    client,
-                    buildQuery(
-                        requestInfo.url,
-                        parameter,
-                        payload
-                    )
-                );
-
-        } else {
-            const formData =
-                buildFormData(
-                    requestInfo.form,
-                    parameter,
-                    payload
-                );
-
-            response =
-                await postForm(
-                    client,
-                    requestInfo.url,
-                    formData
-                );
+        if (!response.body.includes(marker)) {
+            return;
         }
 
+        addFinding(findings, seen, {
+            vulnerability: "Reflected XSS",
 
-        if (
-            response.body.includes(
-                marker
-            )
-        ) {
-            addFinding(
-                findings,
-                seen,
-                {
-                    vulnerability:
-                        "Reflected XSS",
+            affected_module:
+                `${new URL(requestInfo.url).pathname} [${parameter}]`,
 
-                    affected_module:
-                        new URL(
-                            requestInfo.url
-                        ).pathname +
-                        " [" +
-                        parameter +
-                        "]",
+            description:
+                "A unique marker submitted through an application input was reflected in the HTTP response. Reflection alone is an indicator and should be manually validated for executable HTML/JavaScript context.",
 
-                    description:
-                        "A unique scanner marker supplied through an application input was reflected in the HTTP response without being removed.",
+            observed_result:
+                `The unique marker ${marker} was returned after testing parameter ${parameter}.`,
 
-                    observed_result:
-                        "The marker " +
-                        marker +
-                        " was returned by parameter " +
-                        parameter +
-                        ".",
+            impact:
+                "If the reflected value reaches an executable HTML or script context without appropriate encoding, it may allow client-side script injection.",
 
-                    impact:
-                        "Reflected user input may become executable client-side content when the application places the value into an unsafe HTML or script context.",
-
-                    severity:
-                        "High",
-
-                    status:
-                        "Open"
-                }
-            );
-        }
-
+            severity: "High",
+            status: "Open"
+        });
     } catch {
-        // Ignore individual test failures.
+        // Continue scanning if an individual input fails.
     }
 }
 
 
 // =========================================================
-// TEST SQL INJECTION
+// SQL INJECTION TEST
+// Error-based signature testing; blind SQL injection is not
+// covered by this basic detector.
 // =========================================================
 
 async function testSqlInjection(
     client,
     requestInfo,
     parameter,
-    baselineBody,
     findings,
     seen
 ) {
-    const sqlTests = [
+    const payloads = [
         "'",
-        "\"",
+        '"',
         "1' OR '1'='1",
         "1' OR '1'='2"
     ];
 
-
-    for (
-        const payload
-        of sqlTests
-    ) {
+    for (const payload of payloads) {
         try {
-            let response;
+            const response = await issueTestRequest(
+                client,
+                requestInfo,
+                parameter,
+                payload
+            );
 
-            if (
-                requestInfo.method ===
-                "GET"
-            ) {
-                response =
-                    await fetchPage(
-                        client,
-                        buildQuery(
-                            requestInfo.url,
-                            parameter,
-                            payload
-                        )
-                    );
-
-            } else {
-                const formData =
-                    buildFormData(
-                        requestInfo.form,
-                        parameter,
-                        payload
-                    );
-
-                response =
-                    await postForm(
-                        client,
-                        requestInfo.url,
-                        formData
-                    );
+            if (!looksLikeSqlError(response.body)) {
+                continue;
             }
 
+            addFinding(findings, seen, {
+                vulnerability: "SQL Injection",
 
-            const sqlError =
-                looksLikeSqlError(
-                    response.body
-                );
+                affected_module:
+                    `${new URL(requestInfo.url).pathname} [${parameter}]`,
 
+                description:
+                    "A controlled SQL metacharacter or test expression caused SQL-related error indicators in the response.",
 
-            const bodyDifference =
-                Math.abs(
-                    normalizeBody(
-                        response.body
-                    ).length -
-                    normalizeBody(
-                        baselineBody
-                    ).length
-                );
+                observed_result:
+                    `SQL error indicators were detected after testing parameter ${parameter} with a controlled SQL payload.`,
 
+                impact:
+                    "If confirmed, SQL injection may permit query manipulation or unauthorized database access.",
 
-            if (
-                sqlError &&
-                (
-                    bodyDifference > 10 ||
-                    payload === "'"
-                )
-            ) {
-                addFinding(
-                    findings,
-                    seen,
-                    {
-                        vulnerability:
-                            "SQL Injection",
+                severity: "High",
+                status: "Open"
+            });
 
-                        affected_module:
-                            new URL(
-                                requestInfo.url
-                            ).pathname +
-                            " [" +
-                            parameter +
-                            "]",
-
-                        description:
-                            "A controlled SQL metacharacter/payload produced SQL-related error behavior in the application response.",
-
-                        observed_result:
-                            "SQL error indicators were detected after testing parameter " +
-                            parameter +
-                            " with a controlled SQL payload.",
-
-                        impact:
-                            "An attacker may be able to alter database queries, retrieve unauthorized records, or otherwise manipulate database operations.",
-
-                        severity:
-                            "High",
-
-                        status:
-                            "Open"
-                    }
-                );
-
-                return;
-            }
-
+            return;
         } catch {
-            // Ignore individual test failures.
+            // Continue with other SQL payloads.
         }
     }
 }
 
 
 // =========================================================
-// TEST A FORM
+// TEST FORM INPUTS
 // =========================================================
 
 async function testForm(
@@ -1106,206 +820,109 @@ async function testForm(
     findings,
     seen
 ) {
-    const testableInputs =
-        form.inputs.filter(
-            (input) => {
-                const type =
-                    input.type.toLowerCase();
+    let testedCount = 0;
 
-                return ![
-                    "hidden",
-                    "submit",
-                    "button",
-                    "reset",
-                    "file",
-                    "password",
-                    "checkbox",
-                    "radio"
-                ].includes(type);
-            }
+    const excluded = [
+        "hidden",
+        "submit",
+        "button",
+        "reset",
+        "file",
+        "password",
+        "checkbox",
+        "radio"
+    ];
+
+    const inputs = form.inputs.filter(
+        (input) =>
+            !excluded.includes(input.type.toLowerCase())
+    );
+
+    for (const input of inputs) {
+        testedCount += 1;
+
+        const requestInfo = {
+            method: form.method,
+            url: form.action,
+            form
+        };
+
+        await testXss(
+            client,
+            requestInfo,
+            input.name,
+            findings,
+            seen
         );
 
-
-    for (
-        const input
-        of testableInputs
-    ) {
-        const baselineData =
-            buildFormData(
-                form,
-                input.name,
-                input.value ||
-                    "1"
-            );
-
-
-        try {
-            const baseline =
-                form.method ===
-                "POST"
-                    ? await postForm(
-                        client,
-                        form.action,
-                        baselineData
-                    )
-                    : await fetchPage(
-                        client,
-                        buildQuery(
-                            form.action,
-                            input.name,
-                            input.value ||
-                                "1"
-                        )
-                    );
-
-
-            await testXss(
-                client,
-                {
-                    method:
-                        form.method,
-
-                    url:
-                        form.action,
-
-                    form
-                },
-
-                input.name,
-
-                baseline.body,
-
-                findings,
-
-                seen
-            );
-
-
-            await testSqlInjection(
-                client,
-                {
-                    method:
-                        form.method,
-
-                    url:
-                        form.action,
-
-                    form
-                },
-
-                input.name,
-
-                baseline.body,
-
-                findings,
-
-                seen
-            );
-
-        } catch {
-            // Ignore individual form failures.
-        }
+        await testSqlInjection(
+            client,
+            requestInfo,
+            input.name,
+            findings,
+            seen
+        );
     }
+
+    return testedCount;
 }
 
 
 // =========================================================
-// TEST URL PARAMETERS
+// TEST EXISTING URL PARAMETERS
 // =========================================================
 
 async function testUrlParameters(
     client,
     pageUrl,
-    baselineBody,
     findings,
     seen
 ) {
-    const url =
-        new URL(pageUrl);
+    const url = new URL(pageUrl);
 
-    const parameters =
-        Array.from(
-            url.searchParams.keys()
-        );
+    const parameters = Array.from(
+        new Set(url.searchParams.keys())
+    );
 
-    for (
-        const parameter
-        of parameters
-    ) {
+    for (const parameter of parameters) {
         const requestInfo = {
-            method:
-                "GET",
-
-            url:
-                pageUrl
+            method: "GET",
+            url: pageUrl
         };
-
 
         await testXss(
             client,
             requestInfo,
             parameter,
-            baselineBody,
             findings,
             seen
         );
-
 
         await testSqlInjection(
             client,
             requestInfo,
             parameter,
-            baselineBody,
             findings,
             seen
         );
     }
+
+    return parameters.length;
 }
 
 
 // =========================================================
-// DVWA LOGIN
+// DVWA LOGIN TOKEN
 // =========================================================
 
-function getDvwaBaseUrl(
-    targetUrl
-) {
-    const target =
-        new URL(targetUrl);
-
-    let path =
-        target.pathname;
-
-    if (
-        !path.endsWith("/")
-    ) {
-        path += "/";
-    }
-
-    return (
-        target.origin +
-        path
-    );
-}
-
-
-function extractUserToken(
-    html
-) {
+function extractUserToken(html) {
     const patterns = [
         /name\s*=\s*["']user_token["'][^>]*value\s*=\s*["']([^"']+)["']/i,
-
         /value\s*=\s*["']([^"']+)["'][^>]*name\s*=\s*["']user_token["']/i
     ];
 
-    for (
-        const pattern
-        of patterns
-    ) {
-        const match =
-            html.match(
-                pattern
-            );
+    for (const pattern of patterns) {
+        const match = pattern.exec(html || "");
 
         if (match) {
             return match[1];
@@ -1316,112 +933,62 @@ function extractUserToken(
 }
 
 
-async function loginToDvwa(
-    client,
-    targetUrl
-) {
-    const baseUrl =
-        getDvwaBaseUrl(
-            targetUrl
-        );
+// =========================================================
+// DVWA AUTHENTICATION
+// =========================================================
 
+async function loginToDvwa(client, rootUrl) {
     const loginUrl =
-        new URL(
-            "login.php",
-            baseUrl
-        ).toString();
+        new URL("login.php", rootUrl).toString();
 
+    const loginPage = await fetchPage(
+        client,
+        loginUrl
+    );
 
-    // -------------------------------------------------
-    // GET LOGIN PAGE
-    // -------------------------------------------------
-
-    const loginPage =
-        await fetchPage(
-            client,
-            loginUrl
-        );
-
-
-    const token =
-        extractUserToken(
-            loginPage.body
-        );
-
+    const token = extractUserToken(
+        loginPage.body
+    );
 
     if (!token) {
         throw new Error(
-            "DVWA login token was not found on login.php."
+            "DVWA login token was not found on login.php. Verify the DVWA URL and that DVWA is running."
         );
     }
 
-
-    // -------------------------------------------------
-    // CREDENTIALS
-    // -------------------------------------------------
-
     const username =
-        process.env.DVWA_USERNAME ||
-        "admin";
+        process.env.DVWA_USERNAME || "admin";
 
     const password =
-        process.env.DVWA_PASSWORD ||
-        "password";
+        process.env.DVWA_PASSWORD || "password";
 
-
-    // -------------------------------------------------
-    // LOGIN
-    // -------------------------------------------------
-
-    const loginResponse =
-        await postForm(
-            client,
-            loginUrl,
-            {
-                username,
-                password,
-                Login:
-                    "Login",
-                user_token:
-                    token
-            }
-        );
-
-
-    // -------------------------------------------------
-    // VERIFY LOGIN
-    // -------------------------------------------------
+    const loginResponse = await postForm(
+        client,
+        loginUrl,
+        {
+            username,
+            password,
+            Login: "Login",
+            user_token: token
+        }
+    );
 
     if (
         /name\s*=\s*["']username["']/i.test(
             loginResponse.body
         ) &&
-        /login/i.test(
-            loginResponse.body
-        )
+        /login/i.test(loginResponse.body)
     ) {
         throw new Error(
-            "DVWA login failed. Check DVWA_USERNAME and DVWA_PASSWORD."
+            "DVWA login failed. Check DVWA_USERNAME and DVWA_PASSWORD in backend/.env."
         );
     }
 
-
-    // -------------------------------------------------
-    // SET SECURITY LEVEL
-    // -------------------------------------------------
-
     const securityLevel =
-        process.env.DVWA_SECURITY_LEVEL ||
-        "low";
-
+        (process.env.DVWA_SECURITY_LEVEL || "low").toLowerCase();
 
     if (
-        [
-            "low",
-            "medium",
-            "high",
-            "impossible"
-        ].includes(
+        ["low", "medium", "high", "impossible"].includes(
             securityLevel
         )
     ) {
@@ -1431,44 +998,23 @@ async function loginToDvwa(
         );
     }
 
-
-    // -------------------------------------------------
-    // VERIFY AUTHENTICATED PAGE
-    // -------------------------------------------------
-
-    const authenticatedPage =
-        await fetchPage(
-            client,
-            new URL(
-                "index.php",
-                baseUrl
-            ).toString()
-        );
-
-
-    const looksAuthenticated =
-        /Logout/i.test(
-            authenticatedPage.body
-        ) ||
-        /Security Level:/i.test(
-            authenticatedPage.body
-        );
-
+    const dashboard = await fetchPage(
+        client,
+        new URL("index.php", rootUrl).toString()
+    );
 
     if (
-        !looksAuthenticated
+        !/logout/i.test(dashboard.body) &&
+        !/security level:/i.test(dashboard.body)
     ) {
         throw new Error(
-            "DVWA authentication could not be verified."
+            "DVWA authentication could not be verified after login."
         );
     }
 
-
     return {
         loginUrl,
-
         username,
-
         securityLevel
     };
 }
@@ -1483,353 +1029,262 @@ function checkSecurityHeaders(
     findings,
     seen
 ) {
-    const headerTests = [
+    const tests = [
         [
             "x-content-type-options",
             "Missing X-Content-Type-Options header"
         ],
-
         [
             "content-security-policy",
             "Missing Content-Security-Policy header"
         ],
-
         [
             "referrer-policy",
             "Missing Referrer-Policy header"
         ]
     ];
 
+    const path = new URL(response.url).pathname;
 
-    for (
-        const [
-            headerName,
-            title
-        ]
-        of headerTests
-    ) {
-        if (
-            !response.headers[
-                headerName
-            ]
-        ) {
-            addFinding(
-                findings,
-                seen,
-                {
-                    vulnerability:
-                        title,
-
-                    affected_module:
-                        new URL(
-                            response.url
-                        ).pathname,
-
-                    description:
-                        "The HTTP response does not include the recommended security header.",
-
-                    observed_result:
-                        headerName +
-                        " was absent from the response.",
-
-                    impact:
-                        "Missing browser security controls can increase exposure to common web attacks.",
-
-                    severity:
-                        "Low",
-
-                    status:
-                        "Open"
-                }
-            );
+    for (const [headerName, title] of tests) {
+        if (response.headers[headerName]) {
+            continue;
         }
+
+        addFinding(findings, seen, {
+            vulnerability: title,
+
+            affected_module: path,
+
+            description:
+                "The HTTP response does not include a recommended browser security header.",
+
+            observed_result:
+                `${headerName} was absent from the response.`,
+
+            impact:
+                "Missing browser security controls can increase exposure to some client-side attacks; impact depends on the application and deployment context.",
+
+            severity: "Low",
+            status: "Open"
+        });
     }
 }
 
 
 // =========================================================
-// MAIN SCANNER
+// SHOULD CRAWL URL?
 // =========================================================
 
-async function scanTarget(
-    targetUrl
-) {
-    const startedAt =
-        Date.now();
-
-
-    const target =
-        new URL(
-            targetUrl
-        );
-
-
-    if (
-        ![
-            "http:",
-            "https:"
-        ].includes(
-            target.protocol
-        )
-    ) {
-        throw new Error(
-            "Target URL must use HTTP or HTTPS."
-        );
+function shouldCrawl(url, rootUrl) {
+    if (!inDvwaPath(url, rootUrl)) {
+        return false;
     }
 
+    try {
+        const parsed = new URL(url);
 
-    // -------------------------------------------------
-    // LAB TARGET RESTRICTION
-    // -------------------------------------------------
+        if (STATIC_EXTENSIONS.test(parsed.pathname)) {
+            return false;
+        }
 
-    if (
-        ![
-            "localhost",
-            "127.0.0.1"
-        ].includes(
-            target.hostname
-        )
-    ) {
-        throw new Error(
-            "This scanner is restricted to localhost/127.0.0.1 targets."
+        return !BLOCKED_PATHS.some(
+            (part) =>
+                parsed.pathname.toLowerCase().includes(part)
         );
+    } catch {
+        return false;
     }
+}
 
 
-    const client =
-        new SessionClient();
+// =========================================================
+// MAIN DVWA SCANNER
+// =========================================================
 
+async function scanTarget(targetUrl) {
+    const startedAt = Date.now();
 
-    const discovered =
-        new Set([
-            target.toString()
-        ]);
+    const target = assertDvwaRoot(targetUrl);
+    const normalizedTargetUrl = target.toString();
 
+    const client = new SessionClient(
+        target.origin,
+        target.pathname
+    );
 
-    const queue = [
-        target.toString()
-    ];
+    // Always authenticate to DVWA before scanning.
+    const authentication = await loginToDvwa(
+        client,
+        normalizedTargetUrl
+    );
 
+    const authenticated = true;
+    const securityLevel = authentication.securityLevel;
 
-    const pages = [];
+    const queue = [normalizedTargetUrl];
+    const discovered = new Set(queue);
+    const testedFormKeys = new Set();
 
     const findings = [];
+    const seenFindings = new Set();
+    const pages = [];
 
-    const seen =
-        new Set();
-
-
-    // -------------------------------------------------
-    // AUTHENTICATE TO DVWA
-    // -------------------------------------------------
-
-    const authentication =
-        await loginToDvwa(
-            client,
-            targetUrl
-        );
-
-
-    // -------------------------------------------------
-    // CRAWL
-    // -------------------------------------------------
+    let htmlPagesScanned = 0;
+    let formsDiscovered = 0;
+    let parametersTested = 0;
 
     while (
         queue.length &&
-        pages.length < MAX_PAGES
+        pages.length < MAX_RESOURCES
     ) {
-        const current =
-            queue.shift();
+        const current = queue.shift();
 
-
-        if (
-            !shouldCrawl(
-                current
-            )
-        ) {
+        if (!shouldCrawl(current, normalizedTargetUrl)) {
             continue;
         }
 
-
         try {
-            const response =
-                await fetchPage(
-                    client,
-                    current
-                );
-
-
-            pages.push({
-                url:
-                    response.url,
-
-                status:
-                    response.status
-            });
-
-
-            // -------------------------------------------------
-            // SECURITY HEADERS
-            // -------------------------------------------------
-
-            checkSecurityHeaders(
-                response,
-                findings,
-                seen
+            const response = await fetchPage(
+                client,
+                current
             );
 
+            pages.push({
+                url: response.url,
+                status: response.status
+            });
 
             const contentType =
-                response.headers[
-                    "content-type"
-                ] || "";
+                (response.headers["content-type"] || "").toLowerCase();
 
+            const looksLikeHtml =
+                /<(?:!doctype\s+html|html|form|a)\b/i.test(
+                    response.body
+                );
 
             if (
-                !contentType.includes(
-                    "text/html"
-                )
+                !contentType.includes("text/html") &&
+                !looksLikeHtml
             ) {
                 continue;
             }
 
+            htmlPagesScanned += 1;
 
-            // -------------------------------------------------
-            // DISCOVER LINKS
-            // -------------------------------------------------
+            checkSecurityHeaders(
+                response,
+                findings,
+                seenFindings
+            );
 
-            const links =
-                discoverLinks(
-                    response.body,
-                    response.url
-                );
+            // Discover more DVWA pages.
+            const links = discoverLinks(
+                response.body,
+                response.url,
+                normalizedTargetUrl
+            );
 
-
-            for (
-                const link
-                of links
-            ) {
-                if (
-                    !sameHost(
-                        link,
-                        targetUrl
-                    )
-                ) {
-                    continue;
+            for (const link of links) {
+                if (discovered.size >= MAX_RESOURCES) {
+                    break;
                 }
 
-
                 if (
-                    !shouldCrawl(
-                        link
-                    )
+                    !discovered.has(link) &&
+                    shouldCrawl(link, normalizedTargetUrl)
                 ) {
-                    continue;
-                }
-
-
-                if (
-                    !discovered.has(
-                        link
-                    ) &&
-                    discovered.size <
-                        MAX_PAGES
-                ) {
-                    discovered.add(
-                        link
-                    );
-
-                    queue.push(
-                        link
-                    );
+                    discovered.add(link);
+                    queue.push(link);
                 }
             }
 
+            // Discover and test unique forms.
+            const forms = discoverForms(
+                response.body,
+                response.url,
+                normalizedTargetUrl
+            );
 
-            // -------------------------------------------------
-            // DISCOVER FORMS
-            // -------------------------------------------------
+            for (const form of forms) {
+                const formKey = [
+                    form.method,
+                    form.action,
+                    form.inputs
+                        .map(
+                            (input) =>
+                                `${input.name}:${input.type}`
+                        )
+                        .join(",")
+                ].join("|");
 
-            const forms =
-                discoverForms(
-                    response.body,
-                    response.url
-                );
+                if (testedFormKeys.has(formKey)) {
+                    continue;
+                }
 
+                testedFormKeys.add(formKey);
+                formsDiscovered += 1;
 
-            for (
-                const form
-                of forms
-            ) {
-                await testForm(
+                parametersTested += await testForm(
                     client,
                     form,
                     findings,
-                    seen
+                    seenFindings
                 );
             }
 
-
-            // -------------------------------------------------
-            // URL PARAMETERS
-            // -------------------------------------------------
-
-            await testUrlParameters(
+            parametersTested += await testUrlParameters(
                 client,
                 response.url,
-                response.body,
                 findings,
-                seen
+                seenFindings
             );
-
-
         } catch (error) {
             pages.push({
-                url:
-                    current,
-
-                status:
-                    "error",
+                url: current,
+                status: "error",
 
                 error:
-                    error.name ===
-                    "AbortError"
+                    error.name === "AbortError"
                         ? "timeout"
                         : error.message
             });
         }
     }
 
-
-    const durationMs =
-        Date.now() -
-        startedAt;
-
+    const durationMs = Date.now() - startedAt;
 
     return {
-        target_url:
-            target.toString(),
+        target_url: normalizedTargetUrl,
 
-        authenticated:
-            true,
-
+        authenticated,
         authentication,
+        security_level: securityLevel,
 
-        security_level:
-            authentication.securityLevel,
+        pages_scanned: pages.length,
+        html_pages_scanned: htmlPagesScanned,
 
-        pages_scanned:
-            pages.length,
+        // Retained for compatibility with the frontend.
+        javascript_files_scanned: 0,
+        api_endpoints_discovered: 0,
 
-        duration_ms:
-            durationMs,
+        forms_discovered: formsDiscovered,
+        parameters_tested: parametersTested,
+
+        duration_ms: durationMs,
 
         findings,
+        pages,
 
-        pages
+        discovered_api_endpoints: [],
+        javascript_files: []
     };
 }
 
+
+// =========================================================
+// EXPORT
+// =========================================================
 
 module.exports = {
     scanTarget

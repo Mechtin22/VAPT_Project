@@ -1,4 +1,5 @@
 const express = require("express");
+const { URL } = require("url");
 
 const db = require("../config/db");
 
@@ -10,16 +11,26 @@ const router = express.Router();
 
 
 // =========================================================
-// LOCAL LAB TARGET VALIDATION
+// DVWA-ONLY TARGET VALIDATION
 // =========================================================
 
-function isLocalLabTarget(value) {
+function isLocalDvwaTarget(value) {
     try {
         const url = new URL(value);
 
         return (
             ["http:", "https:"].includes(url.protocol) &&
-            ["localhost", "127.0.0.1"].includes(url.hostname)
+
+            ["localhost", "127.0.0.1"].includes(
+                url.hostname.toLowerCase()
+            ) &&
+
+            /^\/dvwa\/?$/i.test(url.pathname) &&
+
+            !url.username &&
+            !url.password &&
+            !url.search &&
+            !url.hash
         );
     } catch {
         return false;
@@ -40,29 +51,28 @@ const severityRank = {
 };
 
 
-function highestSeverity(findings) {
-    return findings.reduce(
-        (highest, finding) => {
-            const current =
-                severityRank[finding.severity] || 0;
+function highestSeverity(items) {
+    return items.reduce(
+        (highest, item) =>
+            (severityRank[item.severity] || 0) >
+            (severityRank[highest] || 0)
+                ? item.severity
+                : highest,
 
-            const existing =
-                severityRank[highest] || 0;
-
-            return current > existing
-                ? finding.severity
-                : highest;
-        },
         "Info"
     );
 }
 
 
 // =========================================================
-// CATEGORY NORMALIZATION
+// FINDING CATEGORY NORMALIZATION
 // =========================================================
 
 function getCategory(vulnerability) {
+    if (!vulnerability) {
+        return "Unknown";
+    }
+
     if (
         /^Missing .* header$/i.test(
             vulnerability
@@ -76,99 +86,76 @@ function getCategory(vulnerability) {
 
 
 // =========================================================
-// EXTRACT PARAMETER
+// EXTRACT PARAMETER NAME
 // =========================================================
 
 function extractParameter(affectedModule) {
-    if (!affectedModule) {
-        return null;
-    }
-
     const match =
-        affectedModule.match(
-            /\[([^\]]+)\]\s*$/
-        );
+        typeof affectedModule === "string"
+            ? affectedModule.match(
+                /\[([^\]]+)\]\s*$/
+            )
+            : null;
 
-    return match
-        ? match[1]
-        : null;
+    return match ? match[1] : null;
 }
 
 
 // =========================================================
-// BUILD FINDING GROUPS
+// GROUP FINDINGS BY CATEGORY
 // =========================================================
 
 function groupFindings(findings) {
     const groups = new Map();
 
     for (const finding of findings) {
-        const category =
-            getCategory(
-                finding.vulnerability
-            );
+        const category = getCategory(
+            finding.vulnerability
+        );
 
         if (!groups.has(category)) {
-            groups.set(
-                category,
-                []
-            );
+            groups.set(category, []);
         }
 
-        groups
-            .get(category)
-            .push(finding);
+        groups.get(category).push(finding);
     }
 
     return Array.from(
-        groups.entries()
-    ).map(
+        groups,
         ([category, items]) => ({
             category,
             items,
-            severity:
-                highestSeverity(items)
+            severity: highestSeverity(items)
         })
     );
 }
 
 
 // =========================================================
-// CREATE SCAN RUN
+// CREATE A SCAN RUN
 // =========================================================
 
 async function createScanRun(assessmentId) {
-    const connection =
-        await db.getConnection();
+    const connection = await db.getConnection();
 
     try {
         await connection.beginTransaction();
 
-        const [
-            rows
-        ] = await connection.query(
+        const [rows] = await connection.query(
             `
                 SELECT
-                    COALESCE(
-                        MAX(scan_number),
-                        0
-                    ) + 1 AS next_scan
+                    COALESCE(MAX(scan_number), 0) + 1
+                        AS next_scan
                 FROM scan_runs
                 WHERE assessment_id = ?
             `,
-            [
-                assessmentId
-            ]
+            [assessmentId]
         );
 
         const scanNumber =
-            Number(
-                rows[0].next_scan
-            );
+            Number(rows[0].next_scan);
 
-        const [
-            result
-        ] = await connection.execute(
+        const [result] = await connection.execute(
             `
                 INSERT INTO scan_runs
                 (
@@ -176,12 +163,7 @@ async function createScanRun(assessmentId) {
                     scan_number,
                     status
                 )
-                VALUES
-                (
-                    ?,
-                    ?,
-                    'Running'
-                )
+                VALUES (?, ?, 'Running')
             `,
             [
                 assessmentId,
@@ -195,11 +177,9 @@ async function createScanRun(assessmentId) {
             scanId: result.insertId,
             scanNumber
         };
-
     } catch (error) {
         await connection.rollback();
         throw error;
-
     } finally {
         connection.release();
     }
@@ -207,13 +187,10 @@ async function createScanRun(assessmentId) {
 
 
 // =========================================================
-// COMPLETE SCAN
+// COMPLETE A SCAN
 // =========================================================
 
-async function completeScan(
-    scanId,
-    result
-) {
+async function completeScan(scanId, summary) {
     await db.execute(
         `
             UPDATE scan_runs
@@ -227,10 +204,10 @@ async function completeScan(
             WHERE id = ?
         `,
         [
-            result.pages_scanned,
-            result.findings_detected,
-            result.findings_created,
-            result.duration_ms || 0,
+            summary.pages_scanned,
+            summary.findings_detected,
+            summary.findings_created,
+            summary.duration_ms,
             scanId
         ]
     );
@@ -238,7 +215,7 @@ async function completeScan(
 
 
 // =========================================================
-// FAIL SCAN
+// MARK A SCAN AS FAILED
 // =========================================================
 
 async function failScan(scanId) {
@@ -251,53 +228,194 @@ async function failScan(scanId) {
                     completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             `,
-            [
-                scanId
-            ]
+            [scanId]
         );
     } catch {
-        // Do not hide original scan error.
+        // Preserve the original scan error.
     }
 }
 
 
 // =========================================================
-// RUN SCAN
+// BUILD UNIQUE TEXT
+// =========================================================
+
+function uniqueText(items, field) {
+    return Array.from(
+        new Set(
+            items
+                .map((item) => item[field])
+                .filter(Boolean)
+        )
+    ).join("\n");
+}
+
+
+// =========================================================
+// BUILD CATEGORY DESCRIPTION
+// =========================================================
+
+function buildDescription(group) {
+    if (
+        group.category ===
+        "Missing Security Headers"
+    ) {
+        return (
+            "One or more recommended HTTP security " +
+            "headers are missing from scanned DVWA pages. " +
+            "Individual missing headers are recorded " +
+            "as occurrences."
+        );
+    }
+
+    return uniqueText(
+        group.items,
+        "description"
+    );
+}
+
+
+// =========================================================
+// BUILD AFFECTED MODULE SUMMARY
+// =========================================================
+
+function buildAffectedModule(group) {
+    return (
+        `${group.items.length} ` +
+        "affected location(s)"
+    );
+}
+
+
+// =========================================================
+// INSERT A CATEGORY-LEVEL FINDING
+// =========================================================
+
+async function createCategoryFinding(
+    assessmentId,
+    scanId,
+    group
+) {
+    const description =
+        buildDescription(group);
+
+    const observedResult =
+        uniqueText(
+            group.items,
+            "observed_result"
+        );
+
+    const impact =
+        uniqueText(
+            group.items,
+            "impact"
+        );
+
+    const affectedModule =
+        buildAffectedModule(group);
+
+    const [insertResult] = await db.execute(
+        `
+            INSERT INTO findings
+            (
+                assessment_id,
+                scan_id,
+                vulnerability,
+                affected_module,
+                description,
+                observed_result,
+                impact,
+                severity,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+            assessmentId,
+            scanId,
+            group.category,
+            affectedModule,
+            description,
+            observedResult,
+            impact,
+            group.severity,
+            "Open"
+        ]
+    );
+
+    return {
+        findingId: insertResult.insertId,
+        description,
+        observedResult,
+        impact,
+        affectedModule
+    };
+}
+
+
+// =========================================================
+// INSERT INDIVIDUAL FINDING OCCURRENCES
+// =========================================================
+
+async function createOccurrences(
+    findingId,
+    items
+) {
+    for (const item of items) {
+        await db.execute(
+            `
+                INSERT INTO finding_occurrences
+                (
+                    finding_id,
+                    detected_vulnerability,
+                    affected_module,
+                    parameter_name
+                )
+                VALUES (?, ?, ?, ?)
+            `,
+            [
+                findingId,
+
+                item.vulnerability ||
+                    "Unknown",
+
+                item.affected_module ||
+                    null,
+
+                extractParameter(
+                    item.affected_module
+                )
+            ]
+        );
+    }
+}
+
+
+// =========================================================
+// RUN AUTOMATED DVWA SCAN
 // POST /api/scans/:assessmentId
 // =========================================================
 
 router.post(
     "/:assessmentId",
     async (req, res) => {
-
         const assessmentId =
-            Number(
-                req.params.assessmentId
-            );
+            Number(req.params.assessmentId);
 
         if (
-            !Number.isInteger(
-                assessmentId
-            ) ||
+            !Number.isInteger(assessmentId) ||
             assessmentId < 1
         ) {
             return res.status(400).json({
-                error:
-                    "Invalid assessment ID"
+                error: "Invalid assessment ID"
             });
         }
 
         let scanId = null;
 
         try {
-
-            // -------------------------------------------------
-            // GET ASSESSMENT
-            // -------------------------------------------------
-
-            const [
-                rows
-            ] = await db.query(
+            // Load assessment.
+            const [rows] = await db.query(
                 `
                     SELECT
                         id,
@@ -306,50 +424,35 @@ router.post(
                     FROM assessments
                     WHERE id = ?
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
 
-            if (rows.length === 0) {
+            if (!rows.length) {
                 return res.status(404).json({
-                    error:
-                        "Assessment not found"
+                    error: "Assessment not found"
                 });
             }
 
-            const assessment =
-                rows[0];
+            const assessment = rows[0];
 
-
-            // -------------------------------------------------
-            // SAFETY CHECK
-            // -------------------------------------------------
-
+            // Reject non-DVWA targets.
             if (
-                !isLocalLabTarget(
+                !isLocalDvwaTarget(
                     assessment.target_url
                 )
             ) {
                 return res.status(400).json({
                     error:
-                        "This lab scanner is restricted to localhost/127.0.0.1 targets."
+                        "This DVWA-only scanner accepts only the local DVWA root URL, for example http://localhost/DVWA/."
                 });
             }
 
+            // Create a scan history record.
+            const scan = await createScanRun(
+                assessmentId
+            );
 
-            // -------------------------------------------------
-            // CREATE SCAN RUN
-            // -------------------------------------------------
-
-            const scan =
-                await createScanRun(
-                    assessmentId
-                );
-
-            scanId =
-                scan.scanId;
-
+            scanId = scan.scanId;
 
             console.log(
                 `Starting Assessment #${assessmentId} - Scan #${scan.scanNumber}`
@@ -359,202 +462,49 @@ router.post(
                 `Target: ${assessment.target_url}`
             );
 
+            // Execute scanner.
+            const started = Date.now();
 
-            // -------------------------------------------------
-            // START TIMER
-            // -------------------------------------------------
-
-            const scanStartTime =
-                Date.now();
-
-
-            // -------------------------------------------------
-            // RUN SCANNER
-            // -------------------------------------------------
-
-            const result =
-                await scanTarget(
-                    assessment.target_url
-                );
-
-
-            // -------------------------------------------------
-            // CALCULATE DURATION
-            // -------------------------------------------------
+            const result = await scanTarget(
+                assessment.target_url
+            );
 
             const durationMs =
-                Date.now() -
-                scanStartTime;
-
-
-            // -------------------------------------------------
-            // GROUP FINDINGS
-            // -------------------------------------------------
+                Date.now() - started;
 
             const rawFindings =
-                Array.isArray(
-                    result.findings
-                )
+                Array.isArray(result.findings)
                     ? result.findings
                     : [];
 
-            const groups =
-                groupFindings(
-                    rawFindings
-                );
-
-
-            let findingsCreated = 0;
+            // Group observations into categories.
+            const groups = groupFindings(
+                rawFindings
+            );
 
             const createdCategories = [];
 
-
-            // -------------------------------------------------
-            // CREATE ONE FINDING PER CATEGORY
-            // -------------------------------------------------
-
-            for (
-                const group of groups
-            ) {
-
-                const first =
-                    group.items[0];
-
-
-                const description =
-                    group.category ===
-                    "Missing Security Headers"
-                        ? "One or more recommended HTTP security headers are missing across the scanned application."
-                        : first.description;
-
-
-                const observedResult =
-                    group.items
-                        .map(
-                            (item) =>
-                                item.observed_result
-                        )
-                        .filter(Boolean)
-                        .join("\n");
-
-
-                const impact =
-                    group.items
-                        .map(
-                            (item) =>
-                                item.impact
-                        )
-                        .filter(Boolean)
-                        .filter(
-                            (
-                                value,
-                                index,
-                                array
-                            ) =>
-                                array.indexOf(
-                                    value
-                                ) === index
-                        )
-                        .join("\n");
-
-
-                // ---------------------------------------------
-                // CREATE CATEGORY FINDING
-                // ---------------------------------------------
-
-                const [
-                    insertResult
-                ] = await db.execute(
-                    `
-                        INSERT INTO findings
-                        (
-                            assessment_id,
-                            scan_id,
-                            vulnerability,
-                            affected_module,
-                            description,
-                            observed_result,
-                            impact,
-                            severity,
-                            status
-                        )
-                        VALUES
-                        (
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?,
-                            ?
-                        )
-                    `,
-                    [
-                        assessmentId,
-                        scanId,
-                        group.category,
-                        `${group.items.length} affected location(s)`,
-                        description,
-                        observedResult,
-                        impact,
-                        group.severity,
-                        "Open"
-                    ]
-                );
-
-
-                const findingId =
-                    insertResult.insertId;
-
-
-                findingsCreated += 1;
-
-
-                // ---------------------------------------------
-                // CREATE OCCURRENCES
-                // ---------------------------------------------
-
-                for (
-                    const item of group.items
-                ) {
-
-                    await db.execute(
-                        `
-                            INSERT INTO finding_occurrences
-                            (
-                                finding_id,
-                                detected_vulnerability,
-                                affected_module,
-                                parameter_name
-                            )
-                            VALUES
-                            (
-                                ?,
-                                ?,
-                                ?,
-                                ?
-                            )
-                        `,
-                        [
-                            findingId,
-                            item.vulnerability,
-                            item.affected_module,
-                            extractParameter(
-                                item.affected_module
-                            )
-                        ]
-                    );
+            // Insert one parent finding per category.
+            for (const group of groups) {
+                if (!group.items.length) {
+                    continue;
                 }
 
+                const finding =
+                    await createCategoryFinding(
+                        assessmentId,
+                        scanId,
+                        group
+                    );
 
-                // ---------------------------------------------
-                // ADD TO RESPONSE
-                // ---------------------------------------------
+                // Store each affected page/parameter.
+                await createOccurrences(
+                    finding.findingId,
+                    group.items
+                );
 
                 createdCategories.push({
-                    id: findingId,
+                    id: finding.findingId,
 
                     vulnerability:
                         group.category,
@@ -562,31 +512,41 @@ router.post(
                     severity:
                         group.severity,
 
-                    status:
-                        "Open",
+                    status: "Open",
 
                     affected_module:
-                        `${group.items.length} affected location(s)`,
+                        finding.affectedModule,
 
                     occurrence_count:
                         group.items.length,
 
-                    description,
+                    description:
+                        finding.description,
 
                     observed_result:
-                        observedResult,
+                        finding.observedResult,
 
-                    impact
+                    impact:
+                        finding.impact,
+
+                    occurrences:
+                        group.items.map((item) => ({
+                            detected_vulnerability:
+                                item.vulnerability,
+
+                            affected_module:
+                                item.affected_module,
+
+                            parameter_name:
+                                extractParameter(
+                                    item.affected_module
+                                )
+                        }))
                 });
             }
 
-
-            // -------------------------------------------------
-            // BUILD SCAN SUMMARY
-            // -------------------------------------------------
-
-            const scanSummary = {
-
+            // Save scan statistics.
+            const summary = {
                 pages_scanned:
                     Number(
                         result.pages_scanned || 0
@@ -596,26 +556,16 @@ router.post(
                     rawFindings.length,
 
                 findings_created:
-                    findingsCreated,
+                    createdCategories.length,
 
                 duration_ms:
                     durationMs
             };
 
-
-            // -------------------------------------------------
-            // UPDATE SCAN
-            // -------------------------------------------------
-
             await completeScan(
                 scanId,
-                scanSummary
+                summary
             );
-
-
-            // -------------------------------------------------
-            // UPDATE ASSESSMENT
-            // -------------------------------------------------
 
             await db.execute(
                 `
@@ -623,23 +573,30 @@ router.post(
                     SET status = 'Completed'
                     WHERE id = ?
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
-
 
             console.log(
                 `Assessment #${assessmentId} - Scan #${scan.scanNumber} completed`
             );
 
+            console.log(
+                `Pages: ${summary.pages_scanned}`
+            );
 
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
+            console.log(
+                `Raw findings: ${summary.findings_detected}`
+            );
 
-            res.json({
+            console.log(
+                `Created findings: ${summary.findings_created}`
+            );
 
+            console.log(
+                `Duration: ${summary.duration_ms} ms`
+            );
+
+            return res.json({
                 message:
                     "Scan completed successfully",
 
@@ -662,48 +619,62 @@ router.post(
                     result.security_level ?? null,
 
                 pages_scanned:
-                    scanSummary.pages_scanned,
+                    summary.pages_scanned,
+
+                html_pages_scanned:
+                    Number(
+                        result.html_pages_scanned || 0
+                    ),
+
+                // Retained for frontend compatibility.
+                javascript_files_scanned:
+                    Number(
+                        result.javascript_files_scanned || 0
+                    ),
+
+                api_endpoints_discovered:
+                    Number(
+                        result.api_endpoints_discovered || 0
+                    ),
+
+                forms_discovered:
+                    Number(
+                        result.forms_discovered || 0
+                    ),
+
+                parameters_tested:
+                    Number(
+                        result.parameters_tested || 0
+                    ),
 
                 duration_ms:
-                    scanSummary.duration_ms,
+                    summary.duration_ms,
 
                 findings_detected:
-                    scanSummary.findings_detected,
+                    summary.findings_detected,
 
                 findings_created:
-                    scanSummary.findings_created,
+                    summary.findings_created,
 
-                // IMPORTANT:
-                // Assessments.jsx expects "findings".
                 findings:
                     createdCategories,
 
-                // Keep categories too for compatibility.
                 categories:
                     createdCategories
             });
-
         } catch (error) {
-
             console.error(
                 "Scan error:",
                 error
             );
 
-
             if (scanId) {
-                await failScan(
-                    scanId
-                );
+                await failScan(scanId);
             }
 
-
-            res.status(500).json({
-                error:
-                    "Scan failed",
-
-                message:
-                    error.message
+            return res.status(500).json({
+                error: "Scan failed",
+                message: error.message
             });
         }
     }
@@ -711,42 +682,28 @@ router.post(
 
 
 // =========================================================
-// GET SCAN HISTORY FOR ASSESSMENT
+// GET SCAN HISTORY
 // GET /api/scans/:assessmentId
 // =========================================================
 
 router.get(
     "/:assessmentId",
     async (req, res) => {
-
         const assessmentId =
-            Number(
-                req.params.assessmentId
-            );
-
+            Number(req.params.assessmentId);
 
         if (
-            !Number.isInteger(
-                assessmentId
-            ) ||
+            !Number.isInteger(assessmentId) ||
             assessmentId < 1
         ) {
             return res.status(400).json({
-                error:
-                    "Invalid assessment ID"
+                error: "Invalid assessment ID"
             });
         }
 
-
         try {
-
-            // -------------------------------------------------
-            // GET SCANS
-            // -------------------------------------------------
-
-            const [
-                scans
-            ] = await db.query(
+            // Load scan history.
+            const [scans] = await db.query(
                 `
                     SELECT
                         id,
@@ -763,19 +720,11 @@ router.get(
                     WHERE assessment_id = ?
                     ORDER BY scan_number DESC
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
 
-
-            // -------------------------------------------------
-            // GET FINDINGS + OCCURRENCES
-            // -------------------------------------------------
-
-            const [
-                findings
-            ] = await db.query(
+            // Load findings and their occurrences.
+            const [rows] = await db.query(
                 `
                     SELECT
                         f.id,
@@ -797,170 +746,92 @@ router.get(
                     LEFT JOIN finding_occurrences o
                         ON f.id = o.finding_id
 
-                    WHERE
-                        f.assessment_id = ?
+                    WHERE f.assessment_id = ?
 
                     ORDER BY
                         f.id DESC,
                         o.id ASC
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
 
-
-            // -------------------------------------------------
-            // CREATE SCAN MAP
-            // -------------------------------------------------
-
-            const scanMap =
-                new Map();
-
-
-            for (
-                const scan of scans
-            ) {
-
-                scanMap.set(
+            // Build scan objects.
+            const scanMap = new Map(
+                scans.map((scan) => [
                     scan.id,
                     {
                         ...scan,
                         findings: []
                     }
-                );
-            }
+                ])
+            );
 
+            const findingMap = new Map();
 
-            // -------------------------------------------------
-            // CREATE FINDING MAP
-            // -------------------------------------------------
-
-            const findingMap =
-                new Map();
-
-
-            for (
-                const row of findings
-            ) {
-
+            for (const row of rows) {
+                // Skip old findings not associated with a scan.
                 if (!row.scan_id) {
                     continue;
                 }
 
+                let finding =
+                    findingMap.get(row.id);
 
-                if (
-                    !findingMap.has(
-                        row.id
-                    )
-                ) {
-
-                    const finding = {
-
-                        id:
-                            row.id,
-
-                        scan_id:
-                            row.scan_id,
-
-                        vulnerability:
-                            row.vulnerability,
-
-                        description:
-                            row.description,
-
-                        observed_result:
-                            row.observed_result,
-
-                        impact:
-                            row.impact,
-
-                        severity:
-                            row.severity,
-
-                        status:
-                            row.status,
-
+                if (!finding) {
+                    finding = {
+                        id: row.id,
+                        scan_id: row.scan_id,
+                        vulnerability: row.vulnerability,
+                        description: row.description,
+                        observed_result: row.observed_result,
+                        impact: row.impact,
+                        severity: row.severity,
+                        status: row.status,
                         occurrences: []
                     };
-
 
                     findingMap.set(
                         row.id,
                         finding
                     );
 
-
                     const scan =
-                        scanMap.get(
-                            row.scan_id
-                        );
-
+                        scanMap.get(row.scan_id);
 
                     if (scan) {
-                        scan.findings.push(
-                            finding
-                        );
+                        scan.findings.push(finding);
                     }
                 }
 
+                // Add an individual occurrence to its parent.
+                if (row.occurrence_id) {
+                    finding.occurrences.push({
+                        id: row.occurrence_id,
 
-                // -------------------------------------------------
-                // ADD OCCURRENCE
-                // -------------------------------------------------
+                        detected_vulnerability:
+                            row.detected_vulnerability,
 
-                if (
-                    row.occurrence_id
-                ) {
+                        affected_module:
+                            row.affected_module,
 
-                    const finding =
-                        findingMap.get(
-                            row.id
-                        );
-
-                    if (finding) {
-                        finding.occurrences.push({
-                            id:
-                                row.occurrence_id,
-
-                            detected_vulnerability:
-                                row.detected_vulnerability,
-
-                            affected_module:
-                                row.affected_module,
-
-                            parameter_name:
-                                row.parameter_name
-                        });
-                    }
+                        parameter_name:
+                            row.parameter_name
+                    });
                 }
             }
 
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
-
-            res.json(
-                Array.from(
-                    scanMap.values()
-                )
+            return res.json(
+                Array.from(scanMap.values())
             );
-
         } catch (error) {
-
             console.error(
                 "Error loading scan history:",
                 error
             );
 
-
-            res.status(500).json({
-                error:
-                    "Failed to load scan history",
-
-                message:
-                    error.message
+            return res.status(500).json({
+                error: "Failed to load scan history",
+                message: error.message
             });
         }
     }
@@ -975,54 +846,30 @@ router.get(
 router.delete(
     "/:assessmentId/history",
     async (req, res) => {
-
         const assessmentId =
-            Number(
-                req.params.assessmentId
-            );
-
+            Number(req.params.assessmentId);
 
         if (
-            !Number.isInteger(
-                assessmentId
-            ) ||
+            !Number.isInteger(assessmentId) ||
             assessmentId < 1
         ) {
             return res.status(400).json({
-                error:
-                    "Invalid assessment ID"
+                error: "Invalid assessment ID"
             });
         }
 
-
         try {
-
-            // -------------------------------------------------
-            // DELETE SCAN RUNS
-            //
-            // Linked findings are deleted through
-            // ON DELETE CASCADE.
-            // -------------------------------------------------
-
-            const [
-                result
-            ] = await db.execute(
+            // Linked findings and occurrences should cascade
+            // when scan_runs is deleted.
+            const [result] = await db.execute(
                 `
                     DELETE FROM scan_runs
                     WHERE assessment_id = ?
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
 
-
-            // -------------------------------------------------
-            // DELETE LEGACY FINDINGS
-            //
-            // These are findings created before scan history.
-            // -------------------------------------------------
-
+            // Also remove legacy findings not connected to a scan.
             await db.execute(
                 `
                     DELETE FROM findings
@@ -1030,14 +877,10 @@ router.delete(
                         assessment_id = ?
                         AND scan_id IS NULL
                 `,
-                [
-                    assessmentId
-                ]
+                [assessmentId]
             );
 
-
-            res.json({
-
+            return res.json({
                 message:
                     "Scan history cleared successfully",
 
@@ -1047,25 +890,23 @@ router.delete(
                 deleted_scans:
                     result.affectedRows
             });
-
         } catch (error) {
-
             console.error(
                 "Error clearing scan history:",
                 error
             );
 
-
-            res.status(500).json({
-                error:
-                    "Failed to clear scan history",
-
-                message:
-                    error.message
+            return res.status(500).json({
+                error: "Failed to clear scan history",
+                message: error.message
             });
         }
     }
 );
 
+
+// =========================================================
+// EXPORT
+// =========================================================
 
 module.exports = router;

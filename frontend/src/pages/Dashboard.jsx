@@ -21,59 +21,159 @@ import {
 
 import api from "../services/api";
 
-import StatCard
-    from "../components/StatCard";
+import StatCard from "../components/StatCard";
 
 function Dashboard() {
-
-    const [findings, setFindings] =
-        useState([]);
+    const [findings, setFindings] = useState([]);
+    const [assessments, setAssessments] = useState([]);
+    const [scanRuns, setScanRuns] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState("");
 
     useEffect(() => {
+        let cancelled = false;
 
-        api.get("/findings")
-            .then(
-                response =>
-                    setFindings(
-                        response.data
-                    )
-            )
-            .catch(
-                error =>
-                    console.error(error)
-            );
+        async function loadDashboard() {
+            setLoading(true);
+            setLoadError("");
 
+            const errors = [];
+
+            try {
+                // Load assessments and findings from the database.
+                const [
+                    assessmentsResult,
+                    findingsResult
+                ] = await Promise.allSettled([
+                    api.get("/assessments"),
+                    api.get("/findings")
+                ]);
+
+                if (cancelled) return;
+
+                let assessmentRows = [];
+                let findingRows = [];
+
+                if (assessmentsResult.status === "fulfilled") {
+                    const data = assessmentsResult.value.data;
+
+                    assessmentRows = Array.isArray(data)
+                        ? data
+                        : [];
+
+                    setAssessments(assessmentRows);
+                } else {
+                    setAssessments([]);
+                    errors.push("Assessments could not be loaded.");
+                }
+
+                if (findingsResult.status === "fulfilled") {
+                    const data = findingsResult.value.data;
+
+                    findingRows = Array.isArray(data)
+                        ? data
+                        : [];
+
+                    setFindings(findingRows);
+                } else {
+                    setFindings([]);
+                    errors.push("Findings could not be loaded.");
+                }
+
+                // Load scan history for every assessment.
+                if (assessmentsResult.status === "fulfilled") {
+                    const scanResults = await Promise.allSettled(
+                        assessmentRows.map((assessment) =>
+                            api.get(`/scans/${assessment.id}`)
+                        )
+                    );
+
+                    if (cancelled) return;
+
+                    const allScans = [];
+
+                    scanResults.forEach((result, index) => {
+                        if (result.status === "rejected") {
+                            errors.push(
+                                `Scan history could not be loaded for assessment #${assessmentRows[index].id}.`
+                            );
+                            return;
+                        }
+
+                        const data = result.value.data;
+
+                        if (!Array.isArray(data)) return;
+
+                        data.forEach((scan) => {
+                            allScans.push({
+                                ...scan,
+                                assessment_id:
+                                    scan.assessment_id ??
+                                    assessmentRows[index].id
+                            });
+                        });
+                    });
+
+                    setScanRuns(allScans);
+                } else {
+                    setScanRuns([]);
+                }
+
+                if (!cancelled) {
+                    setLoadError(errors.join(" "));
+                }
+            } catch (error) {
+                if (!cancelled) {
+                    console.error(
+                        "Error loading dashboard:",
+                        error
+                    );
+
+                    setLoadError(
+                        "Some dashboard data could not be loaded. Progress may be incomplete."
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
+            }
+        }
+
+        loadDashboard();
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
-    const high =
-        findings.filter(
-            f =>
-                f.severity === "High" ||
-                f.severity === "Critical"
-        ).length;
+    // ---------------------------------------------------------
+    // FINDING COUNTS
+    // ---------------------------------------------------------
 
-    const medium =
-        findings.filter(
-            f =>
-                f.severity === "Medium"
-        ).length;
+    const high = findings.filter(
+        (finding) =>
+            finding.severity === "High" ||
+            finding.severity === "Critical"
+    ).length;
 
-    const low =
-        findings.filter(
-            f =>
-                f.severity === "Low" ||
-                f.severity === "Info"
-        ).length;
+    const medium = findings.filter(
+        (finding) => finding.severity === "Medium"
+    ).length;
 
-    const resolved =
-        findings.filter(
-            f =>
-                f.status === "Resolved"
-        ).length;
+    const low = findings.filter(
+        (finding) =>
+            finding.severity === "Low" ||
+            finding.severity === "Info"
+    ).length;
+
+    const resolved = findings.filter(
+        (finding) => finding.status === "Resolved"
+    ).length;
 
     const chartData = [
         {
-            name: "High",
+            name: "High / Critical",
             value: high
         },
         {
@@ -81,7 +181,7 @@ function Dashboard() {
             value: medium
         },
         {
-            name: "Low",
+            name: "Low / Info",
             value: low
         }
     ];
@@ -92,14 +192,97 @@ function Dashboard() {
         "#38bdf8"
     ];
 
+    // ---------------------------------------------------------
+    // SCAN COUNTS
+    // ---------------------------------------------------------
+
+    const totalScans = scanRuns.length;
+
+    const completedScans = scanRuns.filter(
+        (scan) =>
+            String(scan.status).toLowerCase() === "completed"
+    ).length;
+
+    const runningScans = scanRuns.filter(
+        (scan) =>
+            String(scan.status).toLowerCase() === "running"
+    ).length;
+
+    const failedScans = scanRuns.filter(
+        (scan) =>
+            String(scan.status).toLowerCase() === "failed"
+    ).length;
+
+    const pagesScanned = scanRuns.reduce(
+        (total, scan) =>
+            total + Number(scan.pages_scanned || 0),
+        0
+    );
+
+    const assessmentsWithScans = new Set(
+        scanRuns.map((scan) => String(scan.assessment_id))
+    ).size;
+
+    // ---------------------------------------------------------
+    // DYNAMIC PROGRESS
+    //
+    // These percentages are calculated using database records.
+    // No stored scan history means zero scan-related progress.
+    // ---------------------------------------------------------
+
+    const assessmentCoverage = assessments.length > 0
+        ? Math.round(
+            (assessmentsWithScans / assessments.length) * 100
+        )
+        : 0;
+
+    const scanCompletion = totalScans > 0
+        ? Math.round(
+            (completedScans / totalScans) * 100
+        )
+        : 0;
+
+    const findingResolution = findings.length > 0
+        ? Math.round(
+            (resolved / findings.length) * 100
+        )
+        : 0;
+
+    // ---------------------------------------------------------
+    // DYNAMIC PROJECT STATUS
+    // ---------------------------------------------------------
+
+    let projectStatus = "NO SCANS";
+
+    if (runningScans > 0) {
+        projectStatus = "SCANNING";
+    } else if (totalScans > 0 && completedScans === totalScans) {
+        projectStatus = "SCANS COMPLETED";
+    } else if (totalScans > 0) {
+        projectStatus = "REVIEW REQUIRED";
+    }
+
+    let projectSubtitle = "No scan history recorded";
+
+    if (assessments.length === 0) {
+        projectSubtitle = "Create an assessment to get started";
+    } else if (totalScans > 0) {
+        projectSubtitle =
+            `${completedScans} of ${totalScans} scans completed`;
+    }
+
+    const progressDescription = totalScans === 0
+        ? "No scan history is currently recorded."
+        : `${assessmentsWithScans} of ${assessments.length} assessments have scan history.`;
+
+    // ---------------------------------------------------------
+    // RENDER
+    // ---------------------------------------------------------
+
     return (
-
         <div>
-
             <section className="welcome">
-
                 <div>
-
                     <p className="eyebrow">
                         SECURITY OPERATIONS
                     </p>
@@ -113,59 +296,66 @@ function Dashboard() {
                         local web application
                         security assessment.
                     </p>
-
                 </div>
 
                 <div className="target-pill">
-
                     <Activity size={17} />
 
                     <span>
                         Target: localhost/DVWA
                     </span>
-
                 </div>
-
             </section>
 
-            <div className="stats-grid">
+            {loadError && (
+                <div className="panel">
+                    <p role="status">
+                        {loadError}
+                    </p>
+                </div>
+            )}
 
+            {/* -------------------------------------------------
+                SUMMARY CARDS
+            ------------------------------------------------- */}
+
+            <div className="stats-grid">
                 <StatCard
                     title="Total Findings"
-                    value={findings.length}
+                    value={loading ? "..." : findings.length}
                     subtitle="Recorded"
                     icon={Bug}
                 />
 
                 <StatCard
                     title="High / Critical"
-                    value={high}
+                    value={loading ? "..." : high}
                     subtitle="Attention"
                     icon={AlertTriangle}
                 />
 
                 <StatCard
                     title="Resolved"
-                    value={resolved}
-                    subtitle="Retested"
+                    value={loading ? "..." : resolved}
+                    subtitle="Marked resolved"
                     icon={CheckCircle}
                 />
 
                 <StatCard
-                    title="Assessment"
-                    value="Active"
-                    subtitle="In Progress"
+                    title="Assessments"
+                    value={loading ? "..." : assessments.length}
+                    subtitle={loading ? "Loading..." : projectSubtitle}
                     icon={Shield}
                 />
-
             </div>
 
+            {/* -------------------------------------------------
+                CHART AND LIVE PROGRESS
+            ------------------------------------------------- */}
+
             <div className="dashboard-grid">
-
                 <div className="panel chart-panel">
-
                     <div className="panel-header">
-
                         <div>
                             <h3>
                                 Severity Distribution
@@ -175,140 +365,157 @@ function Dashboard() {
                                 Recorded findings
                             </p>
                         </div>
-
                     </div>
 
                     <div className="chart">
+                        {findings.length === 0 && !loading ? (
+                            <div className="empty">
+                                <Shield size={32} />
 
-                        <ResponsiveContainer
-                            width="100%"
-                            height={300}
-                        >
+                                <p>
+                                    No findings available to display.
+                                </p>
+                            </div>
+                        ) : (
+                            <ResponsiveContainer
+                                width="100%"
+                                height={300}
+                            >
+                                <PieChart>
+                                    <Pie
+                                        data={chartData}
+                                        dataKey="value"
+                                        nameKey="name"
+                                        cx="50%"
+                                        cy="50%"
+                                        outerRadius={100}
+                                        innerRadius={60}
+                                    >
+                                        {chartData.map(
+                                            (item, index) => (
+                                                <Cell
+                                                    key={item.name}
+                                                    fill={COLORS[index]}
+                                                />
+                                            )
+                                        )}
+                                    </Pie>
 
-                            <PieChart>
-
-                                <Pie
-                                    data={chartData}
-                                    dataKey="value"
-                                    nameKey="name"
-                                    cx="50%"
-                                    cy="50%"
-                                    outerRadius={100}
-                                    innerRadius={60}
-                                >
-
-                                    {chartData.map(
-                                        (_, index) => (
-
-                                            <Cell
-                                                key={index}
-                                                fill={
-                                                    COLORS[
-                                                        index
-                                                    ]
-                                                }
-                                            />
-
-                                        )
-                                    )}
-
-                                </Pie>
-
-                                <Tooltip />
-
-                            </PieChart>
-
-                        </ResponsiveContainer>
-
+                                    <Tooltip />
+                                </PieChart>
+                            </ResponsiveContainer>
+                        )}
                     </div>
-
                 </div>
 
                 <div className="panel">
-
                     <div className="panel-header">
-
                         <div>
                             <h3>
                                 Assessment Progress
                             </h3>
 
                             <p>
-                                Current project status
+                                {loading
+                                    ? "Loading current project status..."
+                                    : progressDescription}
                             </p>
                         </div>
 
                         <span className="badge blue">
-                            ACTIVE
+                            {loading ? "LOADING" : projectStatus}
                         </span>
-
                     </div>
 
                     <div className="progress-list">
-
                         <Progress
-                            name="Environment Setup"
-                            value={100}
+                            name="Assessment Coverage"
+                            value={loading ? 0 : assessmentCoverage}
                         />
 
                         <Progress
-                            name="Reconnaissance"
-                            value={100}
+                            name="Scan Completion"
+                            value={loading ? 0 : scanCompletion}
                         />
 
                         <Progress
-                            name="Burp Analysis"
-                            value={100}
+                            name="Findings Resolved"
+                            value={loading ? 0 : findingResolution}
                         />
-
-                        <Progress
-                            name="SQL Injection"
-                            value={100}
-                        />
-
-                        <Progress
-                            name="Other Vulnerabilities"
-                            value={25}
-                        />
-
-                        <Progress
-                            name="Retesting"
-                            value={0}
-                        />
-
                     </div>
 
-                </div>
+                    <div className="progress-list">
+                        <div className="progress-item">
+                            <div className="progress-label">
+                                <span>
+                                    Total Scan Runs
+                                </span>
 
+                                <strong>
+                                    {loading ? "..." : totalScans}
+                                </strong>
+                            </div>
+                        </div>
+
+                        <div className="progress-item">
+                            <div className="progress-label">
+                                <span>
+                                    Pages Scanned
+                                </span>
+
+                                <strong>
+                                    {loading ? "..." : pagesScanned}
+                                </strong>
+                            </div>
+                        </div>
+
+                        <div className="progress-item">
+                            <div className="progress-label">
+                                <span>
+                                    Failed Scans
+                                </span>
+
+                                <strong>
+                                    {loading ? "..." : failedScans}
+                                </strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    {!loading && totalScans === 0 && (
+                        <div className="empty">
+                            <Shield size={28} />
+
+                            <p>
+                                No scan history found. Progress will update
+                                when a new scan is recorded.
+                            </p>
+                        </div>
+                    )}
+                </div>
             </div>
 
+            {/* -------------------------------------------------
+                RECENT FINDINGS
+            ------------------------------------------------- */}
+
             <div className="panel">
-
                 <div className="panel-header">
-
                     <div>
-
                         <h3>
                             Recent Findings
                         </h3>
 
                         <p>
-                            Latest recorded
-                            security observations
+                            Latest recorded security observations
                         </p>
-
                     </div>
-
                 </div>
 
                 <div className="table-wrapper">
-
                     <table>
-
                         <thead>
-
                             <tr>
-
                                 <th>
                                     Vulnerability
                                 </th>
@@ -324,123 +531,99 @@ function Dashboard() {
                                 <th>
                                     Status
                                 </th>
-
                             </tr>
-
                         </thead>
 
                         <tbody>
-
                             {findings
                                 .slice(0, 5)
-                                .map(finding => (
-
-                                    <tr
-                                        key={
-                                            finding.id
-                                        }
-                                    >
-
+                                .map((finding) => (
+                                    <tr key={finding.id}>
                                         <td>
                                             <strong>
-                                                {
-                                                    finding.vulnerability
-                                                }
+                                                {finding.vulnerability}
                                             </strong>
                                         </td>
 
                                         <td>
-                                            {
-                                                finding.affected_module ||
-                                                "—"
-                                            }
+                                            {finding.affected_module || "—"}
                                         </td>
 
                                         <td>
-
                                             <span
                                                 className={
-                                                    `severity ${finding.severity.toLowerCase()}`
+                                                    `severity ${
+                                                        String(
+                                                            finding.severity || "info"
+                                                        ).toLowerCase()
+                                                    }`
                                                 }
                                             >
-                                                {
-                                                    finding.severity
-                                                }
+                                                {finding.severity || "Info"}
                                             </span>
-
                                         </td>
 
                                         <td>
-                                            {
-                                                finding.status
-                                            }
+                                            {finding.status || "Open"}
                                         </td>
-
                                     </tr>
-
                                 ))}
-
                         </tbody>
-
                     </table>
 
-                    {findings.length === 0 && (
-
+                    {!loading && findings.length === 0 && (
                         <div className="empty">
-
-                            <Shield
-                                size={32}
-                            />
+                            <Shield size={32} />
 
                             <p>
-                                No findings
-                                recorded yet.
+                                No findings recorded yet.
                             </p>
-
                         </div>
-
                     )}
 
+                    {loading && (
+                        <div className="empty">
+                            <p>
+                                Loading findings...
+                            </p>
+                        </div>
+                    )}
                 </div>
-
             </div>
-
         </div>
     );
 }
 
-function Progress({
-    name,
-    value
-}) {
+// -------------------------------------------------------------
+// REUSABLE PROGRESS BAR
+// -------------------------------------------------------------
+
+function Progress({ name, value }) {
+    const safeValue = Math.max(
+        0,
+        Math.min(100, Number(value) || 0)
+    );
 
     return (
-
         <div className="progress-item">
-
             <div className="progress-label">
-
                 <span>
                     {name}
                 </span>
 
                 <strong>
-                    {value}%
+                    {safeValue}%
                 </strong>
-
             </div>
 
             <div className="progress-track">
-
                 <div
                     className="progress-fill"
                     style={{
-                        width: `${value}%`
+                        width: `${safeValue}%`
                     }}
                 />
-
             </div>
-
         </div>
     );
 }

@@ -10,10 +10,18 @@ const { scanTarget } = require("../services/scanner");
 const router = express.Router();
 
 const uploadsRoot = path.resolve(__dirname, "..", "uploads");
+
 const automaticEvidenceRoot = path.resolve(
     uploadsRoot,
     "automatic-evidence"
 );
+
+const SECURITY_LEVELS = [
+    "low",
+    "medium",
+    "high",
+    "impossible"
+];
 
 const severityRank = {
     Critical: 5,
@@ -23,13 +31,20 @@ const severityRank = {
     Info: 1
 };
 
+
+// =========================================================
+// VALIDATE LOCAL DVWA TARGET
+// =========================================================
+
 function isLocalDvwaTarget(value) {
     try {
         const url = new URL(value);
 
         return (
             ["http:", "https:"].includes(url.protocol) &&
-            ["localhost", "127.0.0.1"].includes(url.hostname.toLowerCase()) &&
+            ["localhost", "127.0.0.1"].includes(
+                url.hostname.toLowerCase()
+            ) &&
             /^\/dvwa\/?$/i.test(url.pathname) &&
             !url.username &&
             !url.password &&
@@ -41,8 +56,15 @@ function isLocalDvwaTarget(value) {
     }
 }
 
+
+// =========================================================
+// FINDING HELPERS
+// =========================================================
+
 function getCategory(vulnerability) {
-    if (!vulnerability) return "Unknown";
+    if (!vulnerability) {
+        return "Unknown";
+    }
 
     if (/^Missing .* header$/i.test(vulnerability)) {
         return "Missing Security Headers";
@@ -52,60 +74,104 @@ function getCategory(vulnerability) {
 }
 
 function extractParameter(affectedModule) {
-    const match = typeof affectedModule === "string"
-        ? affectedModule.match(/\[([^\]]+)\]\s*$/)
-        : null;
+    if (typeof affectedModule !== "string") {
+        return null;
+    }
+
+    const match = affectedModule.match(
+        /\[([^\]]+)\]\s*$/
+    );
 
     return match ? match[1] : null;
+}
+
+function highestSeverity(findings) {
+    return findings.reduce(
+        (highest, finding) => {
+            const current =
+                severityRank[finding.severity] || 0;
+
+            const existing =
+                severityRank[highest] || 0;
+
+            return current > existing
+                ? finding.severity
+                : highest;
+        },
+        "Info"
+    );
 }
 
 function groupFindings(findings) {
     const groups = new Map();
 
     for (const finding of findings) {
-        const category = getCategory(finding.vulnerability);
+        const category = getCategory(
+            finding.vulnerability
+        );
 
-        if (!groups.has(category)) groups.set(category, []);
+        if (!groups.has(category)) {
+            groups.set(category, []);
+        }
+
         groups.get(category).push(finding);
     }
 
-    return Array.from(groups, ([category, items]) => ({
-        category,
-        items,
-        severity: items.reduce(
-            (highest, item) =>
-                (severityRank[item.severity] || 0) >
-                (severityRank[highest] || 0)
-                    ? item.severity
-                    : highest,
-            "Info"
-        )
-    }));
+    return Array.from(groups.entries()).map(
+        ([category, items]) => ({
+            category,
+            items,
+            severity: highestSeverity(items)
+        })
+    );
 }
 
 function uniqueText(items, field) {
     return Array.from(
-        new Set(items.map((item) => item[field]).filter(Boolean))
+        new Set(
+            items
+                .map((item) => item[field])
+                .filter(Boolean)
+        )
     ).join("\n");
 }
 
 function buildDescription(group) {
     if (group.category === "Missing Security Headers") {
         return (
-            "One or more recommended HTTP security headers are missing " +
-            "from scanned DVWA pages. Individual missing headers are " +
-            "recorded as occurrences."
+            "One or more recommended HTTP security headers " +
+            "are missing from scanned DVWA pages. Individual " +
+            "observations are recorded as occurrences."
         );
     }
 
     return uniqueText(group.items, "description");
 }
 
-function resolveStoredUploadPath(storedPath) {
-    if (!storedPath || typeof storedPath !== "string") return null;
+function buildAffectedModule(group) {
+    return `${group.items.length} affected location(s)`;
+}
 
-    let value = storedPath.trim().replace(/\\/g, "/");
-    if (!value) return null;
+
+// =========================================================
+// EVIDENCE FILE PATH SAFETY
+// =========================================================
+
+function resolveStoredUploadPath(storedPath) {
+    if (
+        !storedPath ||
+        typeof storedPath !== "string"
+    ) {
+        return null;
+    }
+
+    let value = storedPath
+        .trim()
+        .replace(/\\/g, "/");
+
+    if (!value) {
+        return null;
+    }
 
     if (/^https?:\/\//i.test(value)) {
         try {
@@ -113,10 +179,14 @@ function resolveStoredUploadPath(storedPath) {
             const marker = "/uploads/";
             const index = parsed.pathname.indexOf(marker);
 
-            if (index < 0) return null;
+            if (index < 0) {
+                return null;
+            }
 
             value = decodeURIComponent(
-                parsed.pathname.slice(index + marker.length)
+                parsed.pathname.slice(
+                    index + marker.length
+                )
             );
         } catch {
             return null;
@@ -131,7 +201,10 @@ function resolveStoredUploadPath(storedPath) {
         ? path.resolve(value)
         : path.resolve(uploadsRoot, value);
 
-    const relative = path.relative(uploadsRoot, resolved);
+    const relative = path.relative(
+        uploadsRoot,
+        resolved
+    );
 
     if (
         !relative ||
@@ -146,7 +219,10 @@ function resolveStoredUploadPath(storedPath) {
 }
 
 function isInsideAutomaticEvidence(filePath) {
-    const relative = path.relative(automaticEvidenceRoot, filePath);
+    const relative = path.relative(
+        automaticEvidenceRoot,
+        filePath
+    );
 
     return (
         relative === "" ||
@@ -162,16 +238,24 @@ async function countFilesRecursively(directory) {
     let entries;
 
     try {
-        entries = await fs.readdir(directory, { withFileTypes: true });
+        entries = await fs.readdir(directory, {
+            withFileTypes: true
+        });
     } catch (error) {
-        if (error.code === "ENOENT") return 0;
+        if (error.code === "ENOENT") {
+            return 0;
+        }
+
         throw error;
     }
 
     let count = 0;
 
     for (const entry of entries) {
-        const entryPath = path.join(directory, entry.name);
+        const entryPath = path.join(
+            directory,
+            entry.name
+        );
 
         if (entry.isDirectory()) {
             count += await countFilesRecursively(entryPath);
@@ -183,8 +267,14 @@ async function countFilesRecursively(directory) {
     return count;
 }
 
+
+// =========================================================
+// CLEAN UP FILES FOR DELETED SCANS
+// =========================================================
+
 async function cleanupEvidenceFiles(scanIds, evidenceRows) {
     const warnings = [];
+
     let deletedAutomaticFiles = 0;
     let deletedManualFiles = 0;
 
@@ -194,11 +284,15 @@ async function cleanupEvidenceFiles(scanIds, evidenceRows) {
             `scan-${Number(scanId)}`
         );
 
-        if (path.dirname(scanDirectory) !== automaticEvidenceRoot) {
+        if (
+            path.dirname(scanDirectory) !==
+            automaticEvidenceRoot
+        ) {
             warnings.push({
                 scan_id: scanId,
-                message: "Unexpected automatic-evidence directory path."
+                message: "Unexpected evidence directory path."
             });
+
             continue;
         }
 
@@ -229,13 +323,17 @@ async function cleanupEvidenceFiles(scanIds, evidenceRows) {
             if (evidence.file_path) {
                 warnings.push({
                     evidence_id: evidence.id,
-                    message: "Unsafe file path; file was not deleted."
+                    message:
+                        "Unsafe evidence path; file was not deleted."
                 });
             }
+
             continue;
         }
 
-        if (isInsideAutomaticEvidence(absolutePath)) continue;
+        if (isInsideAutomaticEvidence(absolutePath)) {
+            continue;
+        }
 
         manualFiles.set(
             `${evidence.file_path}|${absolutePath}`,
@@ -246,21 +344,29 @@ async function cleanupEvidenceFiles(scanIds, evidenceRows) {
         );
     }
 
-    for (const item of manualFiles.values()) {
+    for (const file of manualFiles.values()) {
         try {
+            // Keep any file that is still referenced by another
+            // evidence record.
             const [references] = await db.query(
-                "SELECT COUNT(*) AS total FROM evidence WHERE file_path = ?",
-                [item.storedPath]
+                `
+                    SELECT COUNT(*) AS total
+                    FROM evidence
+                    WHERE file_path = ?
+                `,
+                [file.storedPath]
             );
 
-            if (Number(references[0]?.total || 0) > 0) continue;
+            if (Number(references[0]?.total || 0) > 0) {
+                continue;
+            }
 
-            await fs.unlink(item.absolutePath);
+            await fs.unlink(file.absolutePath);
             deletedManualFiles += 1;
         } catch (error) {
             if (error.code !== "ENOENT") {
                 warnings.push({
-                    file_path: item.storedPath,
+                    file_path: file.storedPath,
                     message: error.message
                 });
             }
@@ -268,35 +374,76 @@ async function cleanupEvidenceFiles(scanIds, evidenceRows) {
     }
 
     return {
-        deleted_automatic_evidence_files: deletedAutomaticFiles,
-        deleted_manual_evidence_files: deletedManualFiles,
+        deleted_automatic_evidence_files:
+            deletedAutomaticFiles,
+
+        deleted_manual_evidence_files:
+            deletedManualFiles,
+
         file_cleanup_warnings: warnings
     };
 }
 
-async function createScanRun(assessmentId) {
+
+// =========================================================
+// CREATE SCAN RUN
+// =========================================================
+
+async function createScanRun(
+    assessmentId,
+    securityLevel
+) {
     const connection = await db.getConnection();
 
     try {
         await connection.beginTransaction();
 
+        // Lock the assessment row to reduce conflicts if two scans
+        // are started for the same assessment simultaneously.
+        const [assessmentRows] = await connection.query(
+            `
+                SELECT id
+                FROM assessments
+                WHERE id = ?
+                FOR UPDATE
+            `,
+            [assessmentId]
+        );
+
+        if (!assessmentRows.length) {
+            throw new Error("Assessment not found.");
+        }
+
         const [rows] = await connection.query(
             `
-                SELECT COALESCE(MAX(scan_number), 0) + 1 AS next_scan
+                SELECT
+                    COALESCE(MAX(scan_number), 0) + 1 AS next_scan
                 FROM scan_runs
                 WHERE assessment_id = ?
             `,
             [assessmentId]
         );
 
-        const scanNumber = Number(rows[0].next_scan);
+        const scanNumber = Number(
+            rows[0].next_scan
+        );
 
         const [result] = await connection.execute(
             `
-                INSERT INTO scan_runs (assessment_id, scan_number, status)
-                VALUES (?, ?, 'Running')
+                INSERT INTO scan_runs
+                (
+                    assessment_id,
+                    scan_number,
+                    status,
+                    security_level
+                )
+                VALUES (?, ?, 'Running', ?)
             `,
-            [assessmentId, scanNumber]
+            [
+                assessmentId,
+                scanNumber,
+                securityLevel
+            ]
         );
 
         await connection.commit();
@@ -313,6 +460,11 @@ async function createScanRun(assessmentId) {
     }
 }
 
+
+// =========================================================
+// COMPLETE OR FAIL A SCAN
+// =========================================================
+
 async function completeScan(scanId, summary) {
     await db.execute(
         `
@@ -327,10 +479,10 @@ async function completeScan(scanId, summary) {
             WHERE id = ?
         `,
         [
-            summary.pages_scanned,
-            summary.findings_detected,
-            summary.findings_created,
-            summary.duration_ms,
+            Number(summary.pages_scanned || 0),
+            Number(summary.findings_detected || 0),
+            Number(summary.findings_created || 0),
+            Number(summary.duration_ms || 0),
             scanId
         ]
     );
@@ -341,21 +493,43 @@ async function failScan(scanId) {
         await db.execute(
             `
                 UPDATE scan_runs
-                SET status = 'Failed', completed_at = CURRENT_TIMESTAMP
+                SET
+                    status = 'Failed',
+                    completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             `,
             [scanId]
         );
-    } catch {
-        // Preserve the original scan error.
+    } catch (error) {
+        console.error(
+            "Could not update failed scan status:",
+            error.message
+        );
     }
 }
 
-async function createCategoryFinding(assessmentId, scanId, group) {
-    const affectedModule =
-        `${group.items.length} affected location(s)`;
 
-    const [result] = await db.execute(
+// =========================================================
+// CREATE A FINDING CATEGORY
+// =========================================================
+
+async function createCategoryFinding(
+    assessmentId,
+    scanId,
+    group
+) {
+    const description = buildDescription(group);
+    const observedResult = uniqueText(
+        group.items,
+        "observed_result"
+    );
+    const impact = uniqueText(
+        group.items,
+        "impact"
+    );
+    const affectedModule = buildAffectedModule(group);
+
+    const [insertResult] = await db.execute(
         `
             INSERT INTO findings
             (
@@ -369,28 +543,36 @@ async function createCategoryFinding(assessmentId, scanId, group) {
                 severity,
                 status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Open')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
             assessmentId,
             scanId,
             group.category,
             affectedModule,
-            buildDescription(group),
-            uniqueText(group.items, "observed_result"),
-            uniqueText(group.items, "impact"),
-            group.severity
+            description,
+            observedResult,
+            impact,
+            group.severity,
+            "Open"
         ]
     );
 
     return {
-        findingId: result.insertId,
+        findingId: insertResult.insertId,
         affectedModule,
-        description: buildDescription(group),
-        observedResult: uniqueText(group.items, "observed_result"),
-        impact: uniqueText(group.items, "impact")
+        description,
+        observedResult,
+        impact
     };
 }
+
+
+// =========================================================
+// CREATE OCCURRENCES AND AUTOMATIC EVIDENCE
+// Every occurrence gets a JSON evidence file and an evidence
+// database row. Failed evidence writes are logged explicitly.
+// =========================================================
 
 async function createOccurrencesAndEvidence({
     findingId,
@@ -402,6 +584,7 @@ async function createOccurrencesAndEvidence({
     items
 }) {
     let evidenceCreated = 0;
+    let evidenceFailed = 0;
 
     for (const item of items) {
         const [occurrenceResult] = await db.execute(
@@ -417,7 +600,7 @@ async function createOccurrencesAndEvidence({
             `,
             [
                 findingId,
-                item.vulnerability || "Unknown",
+                item.vulnerability || category,
                 item.affected_module || null,
                 extractParameter(item.affected_module)
             ]
@@ -429,25 +612,29 @@ async function createOccurrencesAndEvidence({
             evidence_type: "Automated Scan Result",
             evidence_source: "VAPT DVWA scanner",
             created_at: new Date().toISOString(),
+
             target_url: targetUrl,
             scan_id: scanId,
             scan_number: scanNumber,
+
             finding_id: findingId,
             occurrence_id: occurrenceId,
+
             category,
-            detected_vulnerability: item.vulnerability || category,
+            detected_vulnerability:
+                item.vulnerability || category,
+
             severity: item.severity || severity,
             affected_module: item.affected_module || null,
-            parameter_name: extractParameter(item.affected_module),
+            parameter_name:
+                extractParameter(item.affected_module),
+
             description: item.description || null,
             observed_result: item.observed_result || null,
             impact: item.impact || null,
+
             validation_note:
-                category === "Reflected XSS"
-                    ? "Input reflection was detected. Reflection alone does not prove script execution; manually validate the HTML/JavaScript context."
-                    : category === "SQL Injection"
-                        ? "SQL error-based detection summary; validate before treating as a confirmed exploit."
-                        : "Scanner observation summary. No session cookies, passwords or complete raw HTTP response are stored."
+                "Automated observation summary. Validate findings manually before treating them as confirmed vulnerabilities. This evidence record intentionally excludes session cookies, passwords, and complete raw HTTP responses."
         };
 
         const relativeDirectory = path.join(
@@ -460,23 +647,25 @@ async function createOccurrencesAndEvidence({
             relativeDirectory
         );
 
-        const evidenceFileName =
+        const fileName =
             `finding-${findingId}-occurrence-${occurrenceId}-${crypto.randomUUID()}.json`;
 
         const absoluteFilePath = path.join(
             absoluteDirectory,
-            evidenceFileName
+            fileName
         );
 
         const storedFilePath = path
-            .join(relativeDirectory, evidenceFileName)
+            .join(relativeDirectory, fileName)
             .split(path.sep)
             .join("/");
 
         let fileWritten = false;
 
         try {
-            await fs.mkdir(absoluteDirectory, { recursive: true });
+            await fs.mkdir(absoluteDirectory, {
+                recursive: true
+            });
 
             await fs.writeFile(
                 absoluteFilePath,
@@ -497,45 +686,74 @@ async function createOccurrencesAndEvidence({
                         file_path,
                         description
                     )
-                    VALUES (?, ?, ?, 'Scan Result', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 `,
                 [
                     findingId,
                     scanId,
                     occurrenceId,
+                    "Scan Result",
                     storedFilePath,
-                    `Automatic evidence for ${item.vulnerability || category} detected in scan #${scanNumber}.`
+                    `Automatic evidence for ${item.vulnerability || category} in scan #${scanNumber}.`
                 ]
             );
 
             evidenceCreated += 1;
         } catch (error) {
+            evidenceFailed += 1;
+
             if (fileWritten) {
                 try {
                     await fs.unlink(absoluteFilePath);
                 } catch {
-                    // Preserve the original error.
+                    // Keep the original error.
                 }
             }
 
             console.error(
-                `Unable to save evidence for occurrence #${occurrenceId}:`,
+                `Evidence creation failed for scan ${scanId}, ` +
+                `occurrence ${occurrenceId}:`,
                 error.message
             );
         }
     }
 
-    return evidenceCreated;
+    return {
+        evidenceCreated,
+        evidenceFailed
+    };
 }
 
 
+// =========================================================
+// START A SCAN
 // POST /api/scans/:assessmentId
+// =========================================================
+
 router.post("/:assessmentId", async (req, res) => {
     const assessmentId = Number(req.params.assessmentId);
 
-    if (!Number.isInteger(assessmentId) || assessmentId < 1) {
+    if (
+        !Number.isInteger(assessmentId) ||
+        assessmentId < 1
+    ) {
         return res.status(400).json({
-            error: "Invalid assessment ID"
+            error: "Invalid assessment ID."
+        });
+    }
+
+    const requestedSecurityLevel = String(
+        req.body?.security_level ??
+        process.env.DVWA_SECURITY_LEVEL ??
+        "low"
+    ).trim().toLowerCase();
+
+    if (
+        !SECURITY_LEVELS.includes(requestedSecurityLevel)
+    ) {
+        return res.status(400).json({
+            error:
+                "Invalid DVWA security level. Choose low, medium, high, or impossible."
         });
     }
 
@@ -543,13 +761,17 @@ router.post("/:assessmentId", async (req, res) => {
 
     try {
         const [rows] = await db.query(
-            "SELECT id, title, target_url FROM assessments WHERE id = ?",
+            `
+                SELECT id, title, target_url
+                FROM assessments
+                WHERE id = ?
+            `,
             [assessmentId]
         );
 
         if (!rows.length) {
             return res.status(404).json({
-                error: "Assessment not found"
+                error: "Assessment not found."
             });
         }
 
@@ -558,32 +780,72 @@ router.post("/:assessmentId", async (req, res) => {
         if (!isLocalDvwaTarget(assessment.target_url)) {
             return res.status(400).json({
                 error:
-                    "This DVWA-only scanner accepts only the local DVWA root URL, e.g. http://localhost/DVWA/."
+                    "The scanner is restricted to the local DVWA root, " +
+                    "for example http://localhost/DVWA/."
             });
         }
 
-        const scan = await createScanRun(assessmentId);
+        const scan = await createScanRun(
+            assessmentId,
+            requestedSecurityLevel
+        );
+
         scanId = scan.scanId;
 
         console.log(
             `Starting Assessment #${assessmentId} - Scan #${scan.scanNumber}`
         );
         console.log(`Target: ${assessment.target_url}`);
+        console.log(
+            `Requested DVWA security level: ${requestedSecurityLevel}`
+        );
 
-        const started = Date.now();
-        const result = await scanTarget(assessment.target_url);
-        const durationMs = Date.now() - started;
+        const startedAt = Date.now();
+
+        const result = await scanTarget(
+            assessment.target_url,
+            {
+                securityLevel: requestedSecurityLevel
+            }
+        );
+
+        const durationMs = Date.now() - startedAt;
+
+        // Never report that a scan ran at the wrong level.
+        if (
+            String(result.security_level || "").toLowerCase() !==
+            requestedSecurityLevel
+        ) {
+            throw new Error(
+                `Security-level mismatch. Requested ${requestedSecurityLevel}, ` +
+                `scanner returned ${result.security_level || "unknown"}.`
+            );
+        }
+
+        if (
+            result.authentication?.securityLevelVerified !== true
+        ) {
+            throw new Error(
+                "DVWA security level was not verified. The scan cannot be marked as completed."
+            );
+        }
 
         const rawFindings = Array.isArray(result.findings)
             ? result.findings
             : [];
 
         const groups = groupFindings(rawFindings);
+
         const createdCategories = [];
+
+        let findingsCreated = 0;
         let automaticEvidenceCreated = 0;
+        let automaticEvidenceFailed = 0;
 
         for (const group of groups) {
-            if (!group.items.length) continue;
+            if (!group.items.length) {
+                continue;
+            }
 
             const finding = await createCategoryFinding(
                 assessmentId,
@@ -591,7 +853,9 @@ router.post("/:assessmentId", async (req, res) => {
                 group
             );
 
-            automaticEvidenceCreated +=
+            findingsCreated += 1;
+
+            const evidenceResult =
                 await createOccurrencesAndEvidence({
                     findingId: finding.findingId,
                     scanId,
@@ -601,6 +865,12 @@ router.post("/:assessmentId", async (req, res) => {
                     severity: group.severity,
                     items: group.items
                 });
+
+            automaticEvidenceCreated +=
+                evidenceResult.evidenceCreated;
+
+            automaticEvidenceFailed +=
+                evidenceResult.evidenceFailed;
 
             createdCategories.push({
                 id: finding.findingId,
@@ -615,7 +885,8 @@ router.post("/:assessmentId", async (req, res) => {
                 occurrences: group.items.map((item) => ({
                     detected_vulnerability: item.vulnerability,
                     affected_module: item.affected_module,
-                    parameter_name: extractParameter(item.affected_module)
+                    parameter_name:
+                        extractParameter(item.affected_module)
                 }))
             });
         }
@@ -623,49 +894,85 @@ router.post("/:assessmentId", async (req, res) => {
         const summary = {
             pages_scanned: Number(result.pages_scanned || 0),
             findings_detected: rawFindings.length,
-            findings_created: createdCategories.length,
+            findings_created: findingsCreated,
             duration_ms: durationMs
         };
 
         await completeScan(scanId, summary);
 
         await db.execute(
-            "UPDATE assessments SET status = 'Completed' WHERE id = ?",
+            `
+                UPDATE assessments
+                SET status = 'Completed'
+                WHERE id = ?
+            `,
             [assessmentId]
         );
 
         console.log(
-            `Scan #${scan.scanNumber}: ${summary.pages_scanned} pages, ` +
+            `Scan #${scan.scanNumber} completed: ` +
+            `${summary.pages_scanned} pages, ` +
             `${summary.findings_detected} observations, ` +
-            `${summary.findings_created} findings, ` +
-            `${automaticEvidenceCreated} evidence records, ${durationMs} ms`
+            `${findingsCreated} findings, ` +
+            `${automaticEvidenceCreated} evidence records, ` +
+            `${automaticEvidenceFailed} evidence failures.`
         );
 
+        const hasEvidenceWarnings =
+            automaticEvidenceFailed > 0;
+
         return res.json({
-            message: "Scan completed successfully",
+            message: hasEvidenceWarnings
+                ? "Scan completed, but some evidence records could not be saved."
+                : "Scan completed successfully.",
+
             assessment_id: assessmentId,
             scan_id: scanId,
             scan_number: scan.scanNumber,
+
             target_url: assessment.target_url,
             authenticated: result.authenticated ?? null,
-            security_level: result.security_level ?? null,
+
+            security_level: result.security_level,
+            security_level_verified:
+                result.authentication?.securityLevelVerified === true,
+
             pages_scanned: summary.pages_scanned,
-            html_pages_scanned: Number(result.html_pages_scanned || 0),
-            javascript_files_scanned: Number(result.javascript_files_scanned || 0),
-            api_endpoints_discovered: Number(result.api_endpoints_discovered || 0),
-            forms_discovered: Number(result.forms_discovered || 0),
-            parameters_tested: Number(result.parameters_tested || 0),
+            html_pages_scanned:
+                Number(result.html_pages_scanned || 0),
+
+            javascript_files_scanned:
+                Number(result.javascript_files_scanned || 0),
+
+            api_endpoints_discovered:
+                Number(result.api_endpoints_discovered || 0),
+
+            forms_discovered:
+                Number(result.forms_discovered || 0),
+
+            parameters_tested:
+                Number(result.parameters_tested || 0),
+
             duration_ms: summary.duration_ms,
+
             findings_detected: summary.findings_detected,
             findings_created: summary.findings_created,
-            automatic_evidence_created: automaticEvidenceCreated,
+
+            automatic_evidence_created:
+                automaticEvidenceCreated,
+
+            automatic_evidence_failed:
+                automaticEvidenceFailed,
+
             findings: createdCategories,
             categories: createdCategories
         });
     } catch (error) {
         console.error("Scan error:", error);
 
-        if (scanId) await failScan(scanId);
+        if (scanId !== null) {
+            await failScan(scanId);
+        }
 
         return res.status(500).json({
             error: "Scan failed",
@@ -675,13 +982,20 @@ router.post("/:assessmentId", async (req, res) => {
 });
 
 
+// =========================================================
+// GET SCAN HISTORY FOR AN ASSESSMENT
 // GET /api/scans/:assessmentId
+// =========================================================
+
 router.get("/:assessmentId", async (req, res) => {
     const assessmentId = Number(req.params.assessmentId);
 
-    if (!Number.isInteger(assessmentId) || assessmentId < 1) {
+    if (
+        !Number.isInteger(assessmentId) ||
+        assessmentId < 1
+    ) {
         return res.status(400).json({
-            error: "Invalid assessment ID"
+            error: "Invalid assessment ID."
         });
     }
 
@@ -689,9 +1003,17 @@ router.get("/:assessmentId", async (req, res) => {
         const [scans] = await db.query(
             `
                 SELECT
-                    id, assessment_id, scan_number, status,
-                    started_at, completed_at, pages_scanned,
-                    findings_detected, findings_created, duration_ms
+                    id,
+                    assessment_id,
+                    scan_number,
+                    status,
+                    security_level,
+                    started_at,
+                    completed_at,
+                    pages_scanned,
+                    findings_detected,
+                    findings_created,
+                    duration_ms
                 FROM scan_runs
                 WHERE assessment_id = ?
                 ORDER BY scan_number DESC, id DESC
@@ -723,22 +1045,33 @@ router.get("/:assessmentId", async (req, res) => {
             [assessmentId]
         );
 
-        const scanMap = new Map(
-            scans.map((scan) => [
+        const scanMap = new Map();
+
+        for (const scan of scans) {
+            scanMap.set(
                 Number(scan.id),
-                { ...scan, findings: [] }
-            ])
-        );
+                {
+                    ...scan,
+                    findings: []
+                }
+            );
+        }
 
         const findingMap = new Map();
 
         for (const row of rows) {
-            if (!row.scan_id) continue;
+            if (row.scan_id == null) {
+                continue;
+            }
 
-            let finding = findingMap.get(Number(row.id));
+            const scanId = Number(row.scan_id);
 
-            if (!finding) {
-                finding = {
+            if (!scanMap.has(scanId)) {
+                continue;
+            }
+
+            if (!findingMap.has(Number(row.id))) {
+                const finding = {
                     id: row.id,
                     scan_id: row.scan_id,
                     vulnerability: row.vulnerability,
@@ -750,473 +1083,626 @@ router.get("/:assessmentId", async (req, res) => {
                     occurrences: []
                 };
 
-                findingMap.set(Number(row.id), finding);
+                findingMap.set(
+                    Number(row.id),
+                    finding
+                );
 
-                const scan = scanMap.get(Number(row.scan_id));
-                if (scan) scan.findings.push(finding);
+                scanMap.get(scanId).findings.push(finding);
             }
 
-            if (row.occurrence_id) {
-                finding.occurrences.push({
-                    id: row.occurrence_id,
-                    detected_vulnerability: row.detected_vulnerability,
-                    affected_module: row.affected_module,
-                    parameter_name: row.parameter_name
+            if (row.occurrence_id != null) {
+                findingMap
+                    .get(Number(row.id))
+                    .occurrences.push({
+                        id: row.occurrence_id,
+                        detected_vulnerability:
+                            row.detected_vulnerability,
+                        affected_module: row.affected_module,
+                        parameter_name: row.parameter_name
+                    });
+            }
+        }
+
+        return res.json(
+            Array.from(scanMap.values())
+        );
+    } catch (error) {
+        console.error(
+            "Error loading scan history:",
+            error
+        );
+
+        return res.status(500).json({
+            error: "Failed to load scan history.",
+            message: error.message
+        });
+    }
+});
+
+
+// =========================================================
+// CLEAR ALL SCAN HISTORY FOR ONE ASSESSMENT
+// DELETE /api/scans/:assessmentId/history
+// =========================================================
+
+router.delete(
+    "/:assessmentId/history",
+    async (req, res) => {
+        const assessmentId = Number(req.params.assessmentId);
+
+        if (
+            !Number.isInteger(assessmentId) ||
+            assessmentId < 1
+        ) {
+            return res.status(400).json({
+                error: "Invalid assessment ID."
+            });
+        }
+
+        let connection;
+        let transactionStarted = false;
+
+        let scanIds = [];
+        let evidenceRows = [];
+
+        const counts = {
+            deleted_scans: 0,
+            deleted_findings: 0,
+            deleted_occurrences: 0,
+            deleted_retests: 0,
+            deleted_evidence_records: 0
+        };
+
+        try {
+            connection = await db.getConnection();
+
+            await connection.beginTransaction();
+            transactionStarted = true;
+
+            const [assessmentRows] =
+                await connection.query(
+                    `
+                        SELECT id
+                        FROM assessments
+                        WHERE id = ?
+                        FOR UPDATE
+                    `,
+                    [assessmentId]
+                );
+
+            if (!assessmentRows.length) {
+                await connection.rollback();
+                transactionStarted = false;
+
+                return res.status(404).json({
+                    error: "Assessment not found."
                 });
             }
-        }
 
-        return res.json(Array.from(scanMap.values()));
-    } catch (error) {
-        console.error("Error loading scan history:", error);
+            const [scans] = await connection.query(
+                `
+                    SELECT id, status
+                    FROM scan_runs
+                    WHERE assessment_id = ?
+                    FOR UPDATE
+                `,
+                [assessmentId]
+            );
 
-        return res.status(500).json({
-            error: "Failed to load scan history",
-            message: error.message
-        });
-    }
-});
+            const runningScan = scans.find(
+                (scan) =>
+                    String(scan.status).toLowerCase() === "running"
+            );
 
-
-// DELETE /api/scans/:assessmentId/history
-router.delete("/:assessmentId/history", async (req, res) => {
-    const assessmentId = Number(req.params.assessmentId);
-
-    if (!Number.isInteger(assessmentId) || assessmentId < 1) {
-        return res.status(400).json({
-            error: "Invalid assessment ID"
-        });
-    }
-
-    let connection;
-    let transactionStarted = false;
-    let scanIds = [];
-    let evidenceRows = [];
-
-    const counts = {
-        deleted_scans: 0,
-        deleted_findings: 0,
-        deleted_occurrences: 0,
-        deleted_retests: 0,
-        deleted_evidence_records: 0
-    };
-
-    try {
-        connection = await db.getConnection();
-        await connection.beginTransaction();
-        transactionStarted = true;
-
-        const [assessments] = await connection.query(
-            "SELECT id FROM assessments WHERE id = ? FOR UPDATE",
-            [assessmentId]
-        );
-
-        if (!assessments.length) {
-            await connection.rollback();
-            transactionStarted = false;
-
-            return res.status(404).json({
-                error: "Assessment not found"
-            });
-        }
-
-        const [scans] = await connection.query(
-            `
-                SELECT id, scan_number, status
-                FROM scan_runs
-                WHERE assessment_id = ?
-                FOR UPDATE
-            `,
-            [assessmentId]
-        );
-
-        const runningScans = scans.filter(
-            (scan) => String(scan.status).toLowerCase() === "running"
-        );
-
-        if (runningScans.length) {
-            await connection.rollback();
-            transactionStarted = false;
-
-            return res.status(409).json({
-                error: "Cannot clear scan history while a scan is running.",
-                running_scans: runningScans.map((scan) => scan.scan_number)
-            });
-        }
-
-        scanIds = scans.map((scan) => Number(scan.id));
-        counts.deleted_scans = scanIds.length;
-
-        const [findings] = await connection.query(
-            "SELECT id FROM findings WHERE assessment_id = ? FOR UPDATE",
-            [assessmentId]
-        );
-
-        counts.deleted_findings = findings.length;
-
-        const [occurrences] = await connection.query(
-            `
-                SELECT COUNT(*) AS total
-                FROM finding_occurrences o
-                INNER JOIN findings f ON f.id = o.finding_id
-                WHERE f.assessment_id = ?
-            `,
-            [assessmentId]
-        );
-
-        counts.deleted_occurrences = Number(occurrences[0]?.total || 0);
-
-        const [retests] = await connection.query(
-            `
-                SELECT COUNT(*) AS total
-                FROM retests r
-                INNER JOIN findings f ON f.id = r.finding_id
-                WHERE f.assessment_id = ?
-            `,
-            [assessmentId]
-        );
-
-        counts.deleted_retests = Number(retests[0]?.total || 0);
-
-        const [storedEvidence] = await connection.query(
-            `
-                SELECT DISTINCT e.id, e.file_path
-                FROM evidence e
-                LEFT JOIN findings f ON f.id = e.finding_id
-                LEFT JOIN scan_runs sr ON sr.id = e.scan_id
-                WHERE f.assessment_id = ?
-                   OR sr.assessment_id = ?
-            `,
-            [assessmentId, assessmentId]
-        );
-
-        evidenceRows = storedEvidence;
-        counts.deleted_evidence_records = evidenceRows.length;
-
-        await connection.execute(
-            `
-                DELETE e
-                FROM evidence e
-                LEFT JOIN findings f ON f.id = e.finding_id
-                LEFT JOIN scan_runs sr ON sr.id = e.scan_id
-                WHERE f.assessment_id = ?
-                   OR sr.assessment_id = ?
-            `,
-            [assessmentId, assessmentId]
-        );
-
-        await connection.execute(
-            `
-                DELETE r
-                FROM retests r
-                INNER JOIN findings f ON f.id = r.finding_id
-                WHERE f.assessment_id = ?
-            `,
-            [assessmentId]
-        );
-
-        await connection.execute(
-            `
-                DELETE o
-                FROM finding_occurrences o
-                INNER JOIN findings f ON f.id = o.finding_id
-                WHERE f.assessment_id = ?
-            `,
-            [assessmentId]
-        );
-
-        await connection.execute(
-            "DELETE FROM findings WHERE assessment_id = ?",
-            [assessmentId]
-        );
-
-        await connection.execute(
-            "DELETE FROM scan_runs WHERE assessment_id = ?",
-            [assessmentId]
-        );
-
-        await connection.commit();
-        transactionStarted = false;
-    } catch (error) {
-        if (connection && transactionStarted) {
-            try {
+            if (runningScan) {
                 await connection.rollback();
-            } catch {
-                // Preserve the original error.
+                transactionStarted = false;
+
+                return res.status(409).json({
+                    error:
+                        "Cannot clear history while a scan is running."
+                });
             }
-        }
 
-        console.error("Error clearing scan history:", error);
+            scanIds = scans.map(
+                (scan) => Number(scan.id)
+            );
 
-        return res.status(500).json({
-            error: "Failed to clear scan history",
-            message: error.message
-        });
-    } finally {
-        if (connection) connection.release();
-    }
+            counts.deleted_scans = scans.length;
 
-    const cleanup = await cleanupEvidenceFiles(scanIds, evidenceRows);
+            const [findings] = await connection.query(
+                `
+                    SELECT id
+                    FROM findings
+                    WHERE assessment_id = ?
+                    FOR UPDATE
+                `,
+                [assessmentId]
+            );
 
-    return res.json({
-        message: cleanup.file_cleanup_warnings.length
-            ? "Scan history cleared, but some evidence files could not be removed."
-            : "Scan history and linked evidence cleared successfully.",
-        assessment_id: assessmentId,
-        ...counts,
-        ...cleanup
-    });
-});
+            counts.deleted_findings = findings.length;
 
+            const [occurrences] =
+                await connection.query(
+                    `
+                        SELECT COUNT(*) AS total
+                        FROM finding_occurrences o
+                        INNER JOIN findings f
+                            ON f.id = o.finding_id
+                        WHERE f.assessment_id = ?
+                    `,
+                    [assessmentId]
+                );
 
-// DELETE /api/scans/:assessmentId/:scanId
-router.delete("/:assessmentId/:scanId", async (req, res) => {
-    const assessmentId = Number(req.params.assessmentId);
-    const scanId = Number(req.params.scanId);
+            counts.deleted_occurrences = Number(
+                occurrences[0]?.total || 0
+            );
 
-    if (
-        !Number.isInteger(assessmentId) ||
-        assessmentId < 1 ||
-        !Number.isInteger(scanId) ||
-        scanId < 1
-    ) {
-        return res.status(400).json({
-            error: "Invalid assessment ID or scan ID"
-        });
-    }
+            const [retests] = await connection.query(
+                `
+                    SELECT COUNT(*) AS total
+                    FROM retests r
+                    INNER JOIN findings f
+                        ON f.id = r.finding_id
+                    WHERE f.assessment_id = ?
+                `,
+                [assessmentId]
+            );
 
-    let connection;
-    let transactionStarted = false;
-    let evidenceRows = [];
-    let originalScanNumber = null;
-    const renumberedScans = [];
+            counts.deleted_retests = Number(
+                retests[0]?.total || 0
+            );
 
-    const counts = {
-        deleted_scans: 0,
-        deleted_findings: 0,
-        deleted_occurrences: 0,
-        deleted_retests: 0,
-        deleted_evidence_records: 0
-    };
+            const [storedEvidence] =
+                await connection.query(
+                    `
+                        SELECT DISTINCT e.id, e.file_path
+                        FROM evidence e
+                        LEFT JOIN findings f
+                            ON f.id = e.finding_id
+                        WHERE e.scan_id IN (
+                            SELECT id
+                            FROM scan_runs
+                            WHERE assessment_id = ?
+                        )
+                        OR f.assessment_id = ?
+                    `,
+                    [assessmentId, assessmentId]
+                );
 
-    try {
-        connection = await db.getConnection();
-        await connection.beginTransaction();
-        transactionStarted = true;
+            evidenceRows = storedEvidence;
 
-        const [assessments] = await connection.query(
-            "SELECT id FROM assessments WHERE id = ? FOR UPDATE",
-            [assessmentId]
-        );
-
-        if (!assessments.length) {
-            await connection.rollback();
-            transactionStarted = false;
-
-            return res.status(404).json({
-                error: "Assessment not found"
-            });
-        }
-
-        const [scans] = await connection.query(
-            `
-                SELECT id, scan_number, status
-                FROM scan_runs
-                WHERE id = ? AND assessment_id = ?
-                FOR UPDATE
-            `,
-            [scanId, assessmentId]
-        );
-
-        if (!scans.length) {
-            await connection.rollback();
-            transactionStarted = false;
-
-            return res.status(404).json({
-                error: "Scan not found for this assessment"
-            });
-        }
-
-        originalScanNumber = Number(scans[0].scan_number);
-
-        if (String(scans[0].status).toLowerCase() === "running") {
-            await connection.rollback();
-            transactionStarted = false;
-
-            return res.status(409).json({
-                error: "Cannot delete a scan while it is running."
-            });
-        }
-
-        const [findings] = await connection.query(
-            `
-                SELECT id
-                FROM findings
-                WHERE assessment_id = ? AND scan_id = ?
-                FOR UPDATE
-            `,
-            [assessmentId, scanId]
-        );
-
-        counts.deleted_scans = 1;
-        counts.deleted_findings = findings.length;
-
-        const [occurrences] = await connection.query(
-            `
-                SELECT COUNT(*) AS total
-                FROM finding_occurrences o
-                INNER JOIN findings f ON f.id = o.finding_id
-                WHERE f.assessment_id = ? AND f.scan_id = ?
-            `,
-            [assessmentId, scanId]
-        );
-
-        counts.deleted_occurrences = Number(occurrences[0]?.total || 0);
-
-        const [retests] = await connection.query(
-            `
-                SELECT COUNT(*) AS total
-                FROM retests r
-                INNER JOIN findings f ON f.id = r.finding_id
-                WHERE f.assessment_id = ? AND f.scan_id = ?
-            `,
-            [assessmentId, scanId]
-        );
-
-        counts.deleted_retests = Number(retests[0]?.total || 0);
-
-        const [storedEvidence] = await connection.query(
-            `
-                SELECT DISTINCT e.id, e.file_path
-                FROM evidence e
-                LEFT JOIN findings f ON f.id = e.finding_id
-                WHERE e.scan_id = ?
-                   OR (f.assessment_id = ? AND f.scan_id = ?)
-            `,
-            [scanId, assessmentId, scanId]
-        );
-
-        evidenceRows = storedEvidence;
-        counts.deleted_evidence_records = evidenceRows.length;
-
-        await connection.execute(
-            `
-                DELETE FROM evidence
-                WHERE scan_id = ?
-                   OR finding_id IN (
-                        SELECT id
-                        FROM findings
-                        WHERE assessment_id = ? AND scan_id = ?
-                   )
-            `,
-            [scanId, assessmentId, scanId]
-        );
-
-        await connection.execute(
-            `
-                DELETE r
-                FROM retests r
-                INNER JOIN findings f ON f.id = r.finding_id
-                WHERE f.assessment_id = ? AND f.scan_id = ?
-            `,
-            [assessmentId, scanId]
-        );
-
-        await connection.execute(
-            `
-                DELETE o
-                FROM finding_occurrences o
-                INNER JOIN findings f ON f.id = o.finding_id
-                WHERE f.assessment_id = ? AND f.scan_id = ?
-            `,
-            [assessmentId, scanId]
-        );
-
-        await connection.execute(
-            `
-                DELETE FROM findings
-                WHERE assessment_id = ? AND scan_id = ?
-            `,
-            [assessmentId, scanId]
-        );
-
-        await connection.execute(
-            "DELETE FROM scan_runs WHERE id = ? AND assessment_id = ?",
-            [scanId, assessmentId]
-        );
-
-        const [remainingScans] = await connection.query(
-            `
-                SELECT id
-                FROM scan_runs
-                WHERE assessment_id = ?
-                ORDER BY scan_number ASC, id ASC
-                FOR UPDATE
-            `,
-            [assessmentId]
-        );
-
-        // Temporary negative scan numbers prevent collisions with the
-        // unique (assessment_id, scan_number) key during renumbering.
-        await connection.execute(
-            "UPDATE scan_runs SET scan_number = -id WHERE assessment_id = ?",
-            [assessmentId]
-        );
-
-        for (let index = 0; index < remainingScans.length; index += 1) {
-            const id = Number(remainingScans[index].id);
-            const newNumber = index + 1;
+            counts.deleted_evidence_records =
+                evidenceRows.length;
 
             await connection.execute(
                 `
-                    UPDATE scan_runs
-                    SET scan_number = ?
-                    WHERE id = ? AND assessment_id = ?
+                    DELETE FROM evidence
+                    WHERE scan_id IN (
+                        SELECT id
+                        FROM scan_runs
+                        WHERE assessment_id = ?
+                    )
+                    OR finding_id IN (
+                        SELECT id
+                        FROM findings
+                        WHERE assessment_id = ?
+                    )
                 `,
-                [newNumber, id, assessmentId]
+                [assessmentId, assessmentId]
             );
 
-            renumberedScans.push({
-                id,
-                scan_number: newNumber
-            });
-        }
+            await connection.execute(
+                `
+                    DELETE r
+                    FROM retests r
+                    INNER JOIN findings f
+                        ON f.id = r.finding_id
+                    WHERE f.assessment_id = ?
+                `,
+                [assessmentId]
+            );
 
-        await connection.commit();
-        transactionStarted = false;
-    } catch (error) {
-        if (connection && transactionStarted) {
-            try {
-                await connection.rollback();
-            } catch {
-                // Preserve the original error.
+            await connection.execute(
+                `
+                    DELETE o
+                    FROM finding_occurrences o
+                    INNER JOIN findings f
+                        ON f.id = o.finding_id
+                    WHERE f.assessment_id = ?
+                `,
+                [assessmentId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE FROM findings
+                    WHERE assessment_id = ?
+                `,
+                [assessmentId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE FROM scan_runs
+                    WHERE assessment_id = ?
+                `,
+                [assessmentId]
+            );
+
+            await connection.commit();
+            transactionStarted = false;
+        } catch (error) {
+            if (connection && transactionStarted) {
+                try {
+                    await connection.rollback();
+                } catch {
+                    // Preserve the original error.
+                }
+            }
+
+            console.error(
+                "Failed to clear scan history:",
+                error
+            );
+
+            return res.status(500).json({
+                error: "Failed to clear scan history.",
+                message: error.message
+            });
+        } finally {
+            if (connection) {
+                connection.release();
             }
         }
 
-        console.error("Failed to delete individual scan:", error);
+        const cleanup = await cleanupEvidenceFiles(
+            scanIds,
+            evidenceRows
+        );
 
-        return res.status(500).json({
-            error: "Failed to delete scan",
-            message: error.message
+        return res.json({
+            message: cleanup.file_cleanup_warnings.length
+                ? "Scan history cleared, but some evidence files could not be removed."
+                : "Scan history and linked evidence cleared successfully.",
+
+            assessment_id: assessmentId,
+
+            ...counts,
+            ...cleanup
         });
-    } finally {
-        if (connection) connection.release();
     }
+);
 
-    const cleanup = await cleanupEvidenceFiles([scanId], evidenceRows);
 
-    return res.json({
-        message: cleanup.file_cleanup_warnings.length
-            ? "Scan deleted and remaining scans renumbered, but some files could not be removed."
-            : "Scan deleted successfully. Remaining scans have been renumbered.",
-        assessment_id: assessmentId,
-        deleted_scan_id: scanId,
-        deleted_scan_number: originalScanNumber,
-        ...counts,
-        remaining_scan_count: renumberedScans.length,
-        renumbered_scans: renumberedScans,
-        ...cleanup
-    });
-});
+// =========================================================
+// DELETE ONE SCAN
+// DELETE /api/scans/:assessmentId/:scanId
+// =========================================================
+
+router.delete(
+    "/:assessmentId/:scanId",
+    async (req, res) => {
+        const assessmentId = Number(req.params.assessmentId);
+        const scanId = Number(req.params.scanId);
+
+        if (
+            !Number.isInteger(assessmentId) ||
+            assessmentId < 1 ||
+            !Number.isInteger(scanId) ||
+            scanId < 1
+        ) {
+            return res.status(400).json({
+                error: "Invalid assessment ID or scan ID."
+            });
+        }
+
+        let connection;
+        let transactionStarted = false;
+
+        let evidenceRows = [];
+        let originalScanNumber = null;
+        let renumberedScans = [];
+
+        const counts = {
+            deleted_scans: 0,
+            deleted_findings: 0,
+            deleted_occurrences: 0,
+            deleted_retests: 0,
+            deleted_evidence_records: 0
+        };
+
+        try {
+            connection = await db.getConnection();
+
+            await connection.beginTransaction();
+            transactionStarted = true;
+
+            const [assessmentRows] =
+                await connection.query(
+                    `
+                        SELECT id
+                        FROM assessments
+                        WHERE id = ?
+                        FOR UPDATE
+                    `,
+                    [assessmentId]
+                );
+
+            if (!assessmentRows.length) {
+                await connection.rollback();
+                transactionStarted = false;
+
+                return res.status(404).json({
+                    error: "Assessment not found."
+                });
+            }
+
+            const [scans] = await connection.query(
+                `
+                    SELECT id, scan_number, status
+                    FROM scan_runs
+                    WHERE id = ? AND assessment_id = ?
+                    FOR UPDATE
+                `,
+                [scanId, assessmentId]
+            );
+
+            if (!scans.length) {
+                await connection.rollback();
+                transactionStarted = false;
+
+                return res.status(404).json({
+                    error: "Scan not found for this assessment."
+                });
+            }
+
+            if (
+                String(scans[0].status).toLowerCase() ===
+                "running"
+            ) {
+                await connection.rollback();
+                transactionStarted = false;
+
+                return res.status(409).json({
+                    error: "Cannot delete a scan while it is running."
+                });
+            }
+
+            originalScanNumber = Number(
+                scans[0].scan_number
+            );
+
+            const [findings] = await connection.query(
+                `
+                    SELECT id
+                    FROM findings
+                    WHERE assessment_id = ? AND scan_id = ?
+                    FOR UPDATE
+                `,
+                [assessmentId, scanId]
+            );
+
+            counts.deleted_scans = 1;
+            counts.deleted_findings = findings.length;
+
+            const [occurrences] =
+                await connection.query(
+                    `
+                        SELECT COUNT(*) AS total
+                        FROM finding_occurrences o
+                        INNER JOIN findings f
+                            ON f.id = o.finding_id
+                        WHERE
+                            f.assessment_id = ?
+                            AND f.scan_id = ?
+                    `,
+                    [assessmentId, scanId]
+                );
+
+            counts.deleted_occurrences = Number(
+                occurrences[0]?.total || 0
+            );
+
+            const [retests] = await connection.query(
+                `
+                    SELECT COUNT(*) AS total
+                    FROM retests r
+                    INNER JOIN findings f
+                        ON f.id = r.finding_id
+                    WHERE
+                        f.assessment_id = ?
+                        AND f.scan_id = ?
+                `,
+                [assessmentId, scanId]
+            );
+
+            counts.deleted_retests = Number(
+                retests[0]?.total || 0
+            );
+
+            const [storedEvidence] =
+                await connection.query(
+                    `
+                        SELECT DISTINCT e.id, e.file_path
+                        FROM evidence e
+                        LEFT JOIN findings f
+                            ON f.id = e.finding_id
+                        WHERE
+                            e.scan_id = ?
+                            OR (
+                                f.assessment_id = ?
+                                AND f.scan_id = ?
+                            )
+                    `,
+                    [scanId, assessmentId, scanId]
+                );
+
+            evidenceRows = storedEvidence;
+
+            counts.deleted_evidence_records =
+                evidenceRows.length;
+
+            // Remove evidence records before their parent findings.
+            await connection.execute(
+                `
+                    DELETE FROM evidence
+                    WHERE scan_id = ?
+                    OR finding_id IN (
+                        SELECT id
+                        FROM findings
+                        WHERE assessment_id = ? AND scan_id = ?
+                    )
+                `,
+                [scanId, assessmentId, scanId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE r
+                    FROM retests r
+                    INNER JOIN findings f
+                        ON f.id = r.finding_id
+                    WHERE
+                        f.assessment_id = ?
+                        AND f.scan_id = ?
+                `,
+                [assessmentId, scanId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE o
+                    FROM finding_occurrences o
+                    INNER JOIN findings f
+                        ON f.id = o.finding_id
+                    WHERE
+                        f.assessment_id = ?
+                        AND f.scan_id = ?
+                `,
+                [assessmentId, scanId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE FROM findings
+                    WHERE assessment_id = ? AND scan_id = ?
+                `,
+                [assessmentId, scanId]
+            );
+
+            await connection.execute(
+                `
+                    DELETE FROM scan_runs
+                    WHERE id = ? AND assessment_id = ?
+                `,
+                [scanId, assessmentId]
+            );
+
+            const [remaining] = await connection.query(
+                `
+                    SELECT id
+                    FROM scan_runs
+                    WHERE assessment_id = ?
+                    ORDER BY scan_number ASC, id ASC
+                    FOR UPDATE
+                `,
+                [assessmentId]
+            );
+
+            // Use negative temporary numbers to avoid conflicts with
+            // a unique (assessment_id, scan_number) key.
+            await connection.execute(
+                `
+                    UPDATE scan_runs
+                    SET scan_number = -id
+                    WHERE assessment_id = ?
+                `,
+                [assessmentId]
+            );
+
+            renumberedScans = [];
+
+            for (let index = 0; index < remaining.length; index += 1) {
+                const remainingId = Number(
+                    remaining[index].id
+                );
+
+                const newScanNumber = index + 1;
+
+                await connection.execute(
+                    `
+                        UPDATE scan_runs
+                        SET scan_number = ?
+                        WHERE id = ? AND assessment_id = ?
+                    `,
+                    [
+                        newScanNumber,
+                        remainingId,
+                        assessmentId
+                    ]
+                );
+
+                renumberedScans.push({
+                    id: remainingId,
+                    scan_number: newScanNumber
+                });
+            }
+
+            await connection.commit();
+            transactionStarted = false;
+        } catch (error) {
+            if (connection && transactionStarted) {
+                try {
+                    await connection.rollback();
+                } catch {
+                    // Preserve the original error.
+                }
+            }
+
+            console.error(
+                "Failed to delete individual scan:",
+                error
+            );
+
+            return res.status(500).json({
+                error: "Failed to delete scan.",
+                message: error.message
+            });
+        } finally {
+            if (connection) {
+                connection.release();
+            }
+        }
+
+        const cleanup = await cleanupEvidenceFiles(
+            [scanId],
+            evidenceRows
+        );
+
+        return res.json({
+            message: cleanup.file_cleanup_warnings.length
+                ? "Scan deleted, but some evidence files could not be removed."
+                : "Scan deleted successfully. Remaining scans have been renumbered.",
+
+            assessment_id: assessmentId,
+            deleted_scan_id: scanId,
+            deleted_scan_number: originalScanNumber,
+
+            ...counts,
+
+            remaining_scan_count: renumberedScans.length,
+            renumbered_scans: renumberedScans,
+
+            ...cleanup
+        });
+    }
+);
+
+
+// =========================================================
+// EXPORT
+// =========================================================
 
 module.exports = router;

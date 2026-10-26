@@ -31,6 +31,32 @@ function Assessments() {
     const [notice, setNotice] = useState(null);
 
     // =====================================================
+    // DVWA SECURITY LEVEL
+    // =====================================================
+
+    const [scanSecurityLevel, setScanSecurityLevel] =
+        useState("low");
+
+    const securityLevels = [
+        {
+            value: "low",
+            label: "Low"
+        },
+        {
+            value: "medium",
+            label: "Medium"
+        },
+        {
+            value: "high",
+            label: "High"
+        },
+        {
+            value: "impossible",
+            label: "Impossible"
+        }
+    ];
+
+    // =====================================================
     // LOAD ASSESSMENTS
     // =====================================================
 
@@ -154,11 +180,18 @@ function Assessments() {
 
     // =====================================================
     // RUN AUTOMATED SCAN
+    // Pass the selected security level to the backend.
     // =====================================================
 
     const runScan = async (assessment) => {
+        const selectedLevel = scanSecurityLevel;
+
         const confirmed = window.confirm(
-            `Run the automated security scan against ${assessment.target_url}?`
+            `Run the automated security scan?\n\n` +
+            `Assessment: ${assessment.title}\n` +
+            `Target: ${assessment.target_url}\n` +
+            `DVWA security level: ${selectedLevel.toUpperCase()}\n\n` +
+            "The scanner will use its own authenticated DVWA session."
         );
 
         if (!confirmed) {
@@ -171,12 +204,50 @@ function Assessments() {
 
         try {
             const response = await api.post(
-                `/scans/${assessment.id}`
+                `/scans/${assessment.id}`,
+                {
+                    security_level: selectedLevel
+                }
             );
 
-            setScanResult(response.data);
+            const result = response.data;
+
+            // Do not display an apparently successful result if
+            // the backend says the requested security level differs.
+            if (
+                result.security_level &&
+                result.security_level !== selectedLevel
+            ) {
+                throw new Error(
+                    `Security-level mismatch. Selected ${selectedLevel}, ` +
+                    `but the backend returned ${result.security_level}.`
+                );
+            }
+
+            setScanResult(result);
 
             await loadAssessments(false);
+
+            if (
+                result.security_level_verified === false
+            ) {
+                setNotice({
+                    type: "warning",
+                    message:
+                        "The scan response did not confirm the active DVWA security level. " +
+                        "Review the backend logs before relying on the results."
+                });
+            } else {
+                setNotice({
+                    type: "success",
+                    message:
+                        `Scan #${result.scan_number} completed. ` +
+                        `Selected DVWA security level: ` +
+                        `${String(
+                            result.security_level || selectedLevel
+                        ).toUpperCase()}.`
+                });
+            }
         } catch (error) {
             console.error("Scan error:", error);
 
@@ -185,6 +256,7 @@ function Assessments() {
                 message:
                     error.response?.data?.error ||
                     error.response?.data?.message ||
+                    error.message ||
                     "Scan failed."
             });
         } finally {
@@ -424,6 +496,104 @@ function Assessments() {
                 </div>
             )}
 
+            {/* DVWA SECURITY LEVEL SELECTOR */}
+
+            <div className="panel">
+                <div className="panel-header">
+                    <div>
+                        <h3>DVWA Security Level</h3>
+                        <p>
+                            Choose the level the scanner should use
+                            for its next scan.
+                        </p>
+                    </div>
+                </div>
+
+                <div
+                    style={{
+                        display: "grid",
+                        gridTemplateColumns:
+                            "repeat(auto-fit, minmax(220px, 1fr))",
+                        gap: "16px",
+                        alignItems: "end"
+                    }}
+                >
+                    <div>
+                        <label
+                            htmlFor="scan-security-level"
+                            style={{
+                                display: "block",
+                                marginBottom: "8px",
+                                fontWeight: 600
+                            }}
+                        >
+                            Security level for new scans
+                        </label>
+
+                        <select
+                            id="scan-security-level"
+                            name="scan_security_level"
+                            value={scanSecurityLevel}
+                            onChange={(event) =>
+                                setScanSecurityLevel(
+                                    event.target.value
+                                )
+                            }
+                            disabled={
+                                scanningId !== null ||
+                                deletingId !== null
+                            }
+                            style={{
+                                width: "100%",
+                                padding: "10px 12px",
+                                border: "1px solid #d1d5db",
+                                borderRadius: "7px",
+                                background: "var(--input-bg, #ffffff)",
+                                color: "var(--text-color, #111827)",
+                                fontSize: "14px"
+                            }}
+                        >
+                            {securityLevels.map((level) => (
+                                <option
+                                    key={level.value}
+                                    value={level.value}
+                                >
+                                    {level.label}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div>
+                        <p
+                            style={{
+                                margin: 0,
+                                lineHeight: 1.6
+                            }}
+                        >
+                            Selected level:{" "}
+                            <strong>
+                                {scanSecurityLevel.toUpperCase()}
+                            </strong>
+                        </p>
+                    </div>
+                </div>
+
+                <p
+                    style={{
+                        marginTop: "14px",
+                        fontSize: "13px",
+                        lineHeight: 1.6
+                    }}
+                >
+                    The scanner uses a separate authenticated DVWA
+                    session. Changing the security level in your
+                    browser's DVWA tab does not automatically change
+                    the scanner's session. The scan API applies the
+                    level selected here.
+                </p>
+            </div>
+
             {/* CREATE ASSESSMENT */}
 
             {showForm && (
@@ -484,6 +654,10 @@ function Assessments() {
                         <button
                             className="primary-btn"
                             type="submit"
+                            disabled={
+                                scanningId !== null ||
+                                deletingId !== null
+                            }
                         >
                             Create Assessment
                         </button>
@@ -518,6 +692,45 @@ function Assessments() {
                             Close
                         </button>
                     </div>
+
+                    {/* SELECTED AND VERIFIED SECURITY LEVEL */}
+
+                    <div
+                        className="panel"
+                        style={{
+                            margin: "0 0 20px",
+                            padding: "14px 16px"
+                        }}
+                    >
+                        <strong>DVWA Security Level Used</strong>
+
+                        <div
+                            style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                alignItems: "center",
+                                gap: "12px",
+                                marginTop: "8px"
+                            }}
+                        >
+                            <span
+                                className="badge blue"
+                                style={{
+                                    textTransform: "uppercase"
+                                }}
+                            >
+                                {scanResult.security_level || "Unknown"}
+                            </span>
+
+                            <span>
+                                {scanResult.security_level_verified === true
+                                    ? "Level verified by the scanner"
+                                    : "Verification not confirmed in the response"}
+                            </span>
+                        </div>
+                    </div>
+
+                    {/* SCAN METRICS */}
 
                     <div
                         style={{
@@ -576,6 +789,8 @@ function Assessments() {
                             </div>
                         ))}
                     </div>
+
+                    {/* FINDINGS TABLE */}
 
                     {Array.isArray(scanResult.findings) &&
                     scanResult.findings.length > 0 ? (
@@ -676,7 +891,11 @@ function Assessments() {
                                 <button
                                     className="primary-btn"
                                     type="button"
-                                    disabled={busy}
+                                    disabled={
+                                        busy ||
+                                        scanningId !== null ||
+                                        deletingId !== null
+                                    }
                                     onClick={() => runScan(assessment)}
                                     style={{
                                         marginTop: "14px",
@@ -701,7 +920,11 @@ function Assessments() {
 
                                 <button
                                     type="button"
-                                    disabled={busy}
+                                    disabled={
+                                        busy ||
+                                        scanningId !== null ||
+                                        deletingId !== null
+                                    }
                                     onClick={() =>
                                         deleteAssessment(assessment)
                                     }
